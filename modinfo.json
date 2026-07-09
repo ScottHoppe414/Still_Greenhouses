@@ -1,14 +1,18 @@
 {
-    "$schema": "https://moddbcdn.vintagestory.at/schema/modinfo.latest.json",
-    "type": "Code",
-    "modid": "still_greenhouses",
-    "name": "Still_Greenhouses",
-    "authors": [
-        "Unknown"
-    ],
-    "description": "To be added",
-    "version": "1.0.0",
-    "dependencies": {
-        "game": "1.21.0"
-    }
+  "type": "Code",
+  "modid": "stillgreenhouses",
+  "name": "Still Greenhouses",
+  "authors": [
+    "Scott Hoppe"
+  ],
+  "description": "Applies configurable vegetation wind movement inside authoritative greenhouses, cellars, and rooms, with targeted tallgrass render-state and hardcoded client terrain-tessellator diagnostics.",
+  "version": "0.9.9",
+  "side": "Universal",
+  "dependencies": {
+    "game": "1.22.0",
+    "survival": "1.22.0"
+  },
+  "networkVersion": "0.9.1",
+  "requiredOnClient": true,
+  "requiredOnServer": true
 }

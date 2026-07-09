@@ -1,0 +1,16 @@
+E:\Vintage_Story_Projects\Mods\Still_Greenhouses\Still_Greenhouses\bin\Release\modinfo.json
+E:\Vintage_Story_Projects\Mods\Still_Greenhouses\Still_Greenhouses\bin\Release\StillGreenhouses.deps.json
+E:\Vintage_Story_Projects\Mods\Still_Greenhouses\Still_Greenhouses\bin\Release\StillGreenhouses.dll
+E:\Vintage_Story_Projects\Mods\Still_Greenhouses\Still_Greenhouses\bin\Release\StillGreenhouses.pdb
+E:\Vintage_Story_Projects\Mods\Still_Greenhouses\Still_Greenhouses\obj\Release\StillGreenhouses.csproj.AssemblyReference.cache
+E:\Vintage_Story_Projects\Mods\Still_Greenhouses\Still_Greenhouses\obj\Release\StillGreenhouses.GeneratedMSBuildEditorConfig.editorconfig
+E:\Vintage_Story_Projects\Mods\Still_Greenhouses\Still_Greenhouses\obj\Release\StillGreenhouses.AssemblyInfoInputs.cache
+E:\Vintage_Story_Projects\Mods\Still_Greenhouses\Still_Greenhouses\obj\Release\StillGreenhouses.AssemblyInfo.cs
+E:\Vintage_Story_Projects\Mods\Still_Greenhouses\Still_Greenhouses\obj\Release\StillGreenhouses.csproj.CoreCompileInputs.cache
+E:\Vintage_Story_Projects\Mods\Still_Greenhouses\Still_Greenhouses\obj\Release\StillGreenhouses.sourcelink.json
+E:\Vintage_Story_Projects\Mods\Still_Greenhouses\Still_Greenhouses\obj\Release\StillGreenhouses.dll
+E:\Vintage_Story_Projects\Mods\Still_Greenhouses\Still_Greenhouses\obj\Release\refint\StillGreenhouses.dll
+E:\Vintage_Story_Projects\Mods\Still_Greenhouses\Still_Greenhouses\obj\Release\StillGreenhouses.pdb
+E:\Vintage_Story_Projects\Mods\Still_Greenhouses\Still_Greenhouses\obj\Release\ref\StillGreenhouses.dll
+E:\Vintage_Story_Projects\Mods\Still_Greenhouses\Still_Greenhouses\bin\Release\assets\stillgreenhouses\config\configlib-patches.json
+E:\Vintage_Story_Projects\Mods\Still_Greenhouses\Still_Greenhouses\bin\Release\assets\stillgreenhouses\lang\en.json

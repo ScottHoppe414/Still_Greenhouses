@@ -1,0 +1,78 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <AssemblyName>StillGreenhouses</AssemblyName>
+    <RootNamespace>StillGreenhouses</RootNamespace>
+
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+
+    <!-- Vintage Story installation directory -->
+    <VSInstallPath>$(VINTAGE_STORY_INSTALL)</VSInstallPath>
+
+    <VSSurvivalModPath Condition="Exists('$(VSInstallPath)/Mods/VSSurvivalMod.dll')">$(VSInstallPath)/Mods/VSSurvivalMod.dll</VSSurvivalModPath>
+    <VSSurvivalModPath Condition="'$(VSSurvivalModPath)' == '' and Exists('$(VSInstallPath)/VSSurvivalMod.dll')">$(VSInstallPath)/VSSurvivalMod.dll</VSSurvivalModPath>
+
+    <VSEssentialsPath Condition="Exists('$(VSInstallPath)/Mods/VSEssentials.dll')">$(VSInstallPath)/Mods/VSEssentials.dll</VSEssentialsPath>
+    <VSEssentialsPath Condition="'$(VSEssentialsPath)' == '' and Exists('$(VSInstallPath)/VSEssentials.dll')">$(VSInstallPath)/VSEssentials.dll</VSEssentialsPath>
+
+    <HarmonyPath Condition="Exists('$(VSInstallPath)/Lib/0Harmony.dll')">$(VSInstallPath)/Lib/0Harmony.dll</HarmonyPath>
+    <HarmonyPath Condition="'$(HarmonyPath)' == '' and Exists('$(VSInstallPath)/0Harmony.dll')">$(VSInstallPath)/0Harmony.dll</HarmonyPath>
+  </PropertyGroup>
+
+  <Target Name="ValidateVintageStoryPath" BeforeTargets="ResolveReferences" Condition="'$(VSInstallPath)' == ''">
+    <Error Text="Set VINTAGE_STORY_INSTALL to the Vintage Story installation directory." />
+  </Target>
+
+  <Target Name="ValidateVintageStoryAPIPath" BeforeTargets="ResolveReferences" Condition="'$(VSInstallPath)' != '' and !Exists('$(VSInstallPath)/VintagestoryAPI.dll')">
+    <Error Text="Could not locate VintagestoryAPI.dll under $(VSInstallPath)." />
+  </Target>
+
+  <Target Name="ValidateSurvivalModPath" BeforeTargets="ResolveReferences" Condition="'$(VSInstallPath)' != '' and '$(VSSurvivalModPath)' == ''">
+    <Error Text="Could not locate VSSurvivalMod.dll under $(VSInstallPath)/Mods." />
+  </Target>
+
+  <Target Name="ValidateEssentialsPath" BeforeTargets="ResolveReferences" Condition="'$(VSInstallPath)' != '' and '$(VSEssentialsPath)' == ''">
+    <Error Text="Could not locate VSEssentials.dll under $(VSInstallPath)/Mods." />
+  </Target>
+
+  <Target Name="ValidateHarmonyPath" BeforeTargets="ResolveReferences" Condition="'$(VSInstallPath)' != '' and '$(HarmonyPath)' == ''">
+    <Error Text="Could not locate 0Harmony.dll under $(VSInstallPath)/Lib." />
+  </Target>
+
+  <ItemGroup>
+    <PackageReference Include="protobuf-net" Version="2.4.9" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="VintagestoryAPI">
+      <HintPath>$(VSInstallPath)/VintagestoryAPI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <Reference Include="VSSurvivalMod">
+      <HintPath>$(VSSurvivalModPath)</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <Reference Include="VSEssentials">
+      <HintPath>$(VSEssentialsPath)</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <Reference Include="0Harmony">
+      <HintPath>$(HarmonyPath)</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="modinfo.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="assets\**\*" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

@@ -1,8 +1,13 @@
 {
   "version": 2,
-  "dgSpecHash": "Q4EPughcOkw=",
+  "dgSpecHash": "7nOeIVAVPH0=",
   "success": true,
-  "projectFilePath": "E:\\Vintage_Story_Projects\\Mods\\Still_Greenhouses\\Still_Greenhouses\\Still_Greenhouses.csproj",
-  "expectedPackageFiles": [],
+  "projectFilePath": "E:\\Vintage_Story_Projects\\Mods\\Still_Greenhouses\\Still_Greenhouses\\StillGreenhouses.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\scott\\.nuget\\packages\\microsoft.netcore.platforms\\2.1.0\\microsoft.netcore.platforms.2.1.0.nupkg.sha512",
+    "C:\\Users\\scott\\.nuget\\packages\\protobuf-net\\2.4.9\\protobuf-net.2.4.9.nupkg.sha512",
+    "C:\\Users\\scott\\.nuget\\packages\\system.private.servicemodel\\4.5.3\\system.private.servicemodel.4.5.3.nupkg.sha512",
+    "C:\\Users\\scott\\.nuget\\packages\\system.servicemodel.primitives\\4.5.3\\system.servicemodel.primitives.4.5.3.nupkg.sha512"
+  ],
   "logs": []
 }
