@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("StillGreenhouses")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+01999c2495698c3849bd6604fd3eeff6553850ec")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+f42ef5522276affe0e1f8e85238f05908c893103")]
 [assembly: System.Reflection.AssemblyProductAttribute("StillGreenhouses")]
 [assembly: System.Reflection.AssemblyTitleAttribute("StillGreenhouses")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

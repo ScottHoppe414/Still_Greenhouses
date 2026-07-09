@@ -1,0 +1,18 @@
+{
+  "type": "Code",
+  "modid": "stillgreenhouses",
+  "name": "Still Greenhouses",
+  "authors": [
+    "GraveCatalyst"
+  ],
+  "description": "Applies configurable vegetation wind movement inside authoritative greenhouses, cellars, and rooms.",
+  "version": "2.0.0",
+  "side": "Universal",
+  "dependencies": {
+    "game": "1.22.0",
+    "survival": "1.22.0"
+  },
+  "networkVersion": "2.0.0",
+  "requiredOnClient": true,
+  "requiredOnServer": true
+}

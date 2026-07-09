@@ -1,0 +1,239 @@
+{
+  "version": 2,
+  "file": "stillgreenhouses.json",
+  "patches": {},
+  "settings": [
+    {
+      "type": "separator",
+      "title": "stillgreenhouses:config-restart-required"
+    },
+    {
+      "type": "separator",
+      "title": "stillgreenhouses:config-visual-title"
+    },
+    {
+      "code": "ClientVisualEnabled",
+      "ingui": "stillgreenhouses:config-client-visual-enabled",
+      "comment": "stillgreenhouses:config-client-visual-enabled-comment",
+      "type": "boolean",
+      "default": true,
+      "clientSide": true
+    },
+    {
+      "code": "GreenhouseWindMode",
+      "ingui": "stillgreenhouses:config-greenhouse-wind-mode",
+      "comment": "stillgreenhouses:config-greenhouse-wind-mode-comment",
+      "type": "string",
+      "default": "VanillaLowWind",
+      "clientSide": true,
+      "values": [
+        "NoWind",
+        "VanillaLowWind"
+      ]
+    },
+    {
+      "type": "separator",
+      "title": "stillgreenhouses:config-room-types-title"
+    },
+    {
+      "code": "ApplyToGreenhouses",
+      "ingui": "stillgreenhouses:config-apply-greenhouses",
+      "comment": "stillgreenhouses:config-apply-greenhouses-comment",
+      "type": "boolean",
+      "default": true,
+      "clientSide": true
+    },
+    {
+      "code": "ApplyToCellars",
+      "ingui": "stillgreenhouses:config-apply-cellars",
+      "comment": "stillgreenhouses:config-apply-cellars-comment",
+      "type": "boolean",
+      "default": false,
+      "clientSide": true
+    },
+    {
+      "code": "ApplyToRooms",
+      "ingui": "stillgreenhouses:config-apply-rooms",
+      "comment": "stillgreenhouses:config-apply-rooms-comment",
+      "type": "boolean",
+      "default": false,
+      "clientSide": true
+    },
+    {
+      "type": "separator",
+      "title": "stillgreenhouses:config-room-wind-ranges-title"
+    },
+    {
+      "type": "separator",
+      "title": "stillgreenhouses:config-greenhouse-wind-range-title"
+    },
+    {
+      "code": "GreenhouseWindLowerPercent",
+      "ingui": "stillgreenhouses:config-greenhouse-wind-lower",
+      "comment": "stillgreenhouses:config-greenhouse-wind-lower-comment",
+      "type": "float",
+      "default": 5.0,
+      "clientSide": true,
+      "range": {
+        "min": 0.0,
+        "max": 200.0
+      }
+    },
+    {
+      "code": "GreenhouseWindUpperPercent",
+      "ingui": "stillgreenhouses:config-greenhouse-wind-upper",
+      "comment": "stillgreenhouses:config-greenhouse-wind-upper-comment",
+      "type": "float",
+      "default": 5.0,
+      "clientSide": true,
+      "range": {
+        "min": 0.0,
+        "max": 200.0
+      }
+    },
+    {
+      "type": "separator",
+      "title": "stillgreenhouses:config-cellar-wind-range-title"
+    },
+    {
+      "code": "CellarWindLowerPercent",
+      "ingui": "stillgreenhouses:config-cellar-wind-lower",
+      "comment": "stillgreenhouses:config-cellar-wind-lower-comment",
+      "type": "float",
+      "default": 5.0,
+      "clientSide": true,
+      "range": {
+        "min": 0.0,
+        "max": 200.0
+      }
+    },
+    {
+      "code": "CellarWindUpperPercent",
+      "ingui": "stillgreenhouses:config-cellar-wind-upper",
+      "comment": "stillgreenhouses:config-cellar-wind-upper-comment",
+      "type": "float",
+      "default": 5.0,
+      "clientSide": true,
+      "range": {
+        "min": 0.0,
+        "max": 200.0
+      }
+    },
+    {
+      "type": "separator",
+      "title": "stillgreenhouses:config-room-wind-range-title"
+    },
+    {
+      "code": "RoomWindLowerPercent",
+      "ingui": "stillgreenhouses:config-room-wind-lower",
+      "comment": "stillgreenhouses:config-room-wind-lower-comment",
+      "type": "float",
+      "default": 5.0,
+      "clientSide": true,
+      "range": {
+        "min": 0.0,
+        "max": 200.0
+      }
+    },
+    {
+      "code": "RoomWindUpperPercent",
+      "ingui": "stillgreenhouses:config-room-wind-upper",
+      "comment": "stillgreenhouses:config-room-wind-upper-comment",
+      "type": "float",
+      "default": 5.0,
+      "clientSide": true,
+      "range": {
+        "min": 0.0,
+        "max": 200.0
+      }
+    },
+    {
+      "type": "separator",
+      "title": "stillgreenhouses:config-vegetation-types-title"
+    },
+    {
+      "code": "ApplyToCrops",
+      "ingui": "stillgreenhouses:config-apply-crops",
+      "comment": "stillgreenhouses:config-apply-crops-comment",
+      "type": "boolean",
+      "default": true,
+      "clientSide": true
+    },
+    {
+      "code": "ApplyToFlowers",
+      "ingui": "stillgreenhouses:config-apply-flowers",
+      "comment": "stillgreenhouses:config-apply-flowers-comment",
+      "type": "boolean",
+      "default": true,
+      "clientSide": true
+    },
+    {
+      "code": "ApplyToHerbs",
+      "ingui": "stillgreenhouses:config-apply-herbs",
+      "comment": "stillgreenhouses:config-apply-herbs-comment",
+      "type": "boolean",
+      "default": true,
+      "clientSide": true
+    },
+    {
+      "code": "ApplyToBerryBushes",
+      "ingui": "stillgreenhouses:config-apply-berry-bushes",
+      "comment": "stillgreenhouses:config-apply-berry-bushes-comment",
+      "type": "boolean",
+      "default": true,
+      "clientSide": true
+    },
+    {
+      "code": "ApplyToTallPlants",
+      "ingui": "stillgreenhouses:config-apply-tall-plants",
+      "comment": "stillgreenhouses:config-apply-tall-plants-comment",
+      "type": "boolean",
+      "default": true,
+      "clientSide": true
+    },
+    {
+      "code": "ApplyToVines",
+      "ingui": "stillgreenhouses:config-apply-vines",
+      "comment": "stillgreenhouses:config-apply-vines-comment",
+      "type": "boolean",
+      "default": true,
+      "clientSide": true
+    },
+    {
+      "code": "ApplyToFruitTreeLeaves",
+      "ingui": "stillgreenhouses:config-apply-fruit-tree-leaves",
+      "comment": "stillgreenhouses:config-apply-fruit-tree-leaves-comment",
+      "type": "boolean",
+      "default": true,
+      "clientSide": true
+    },
+    {
+      "code": "ApplyToOtherVegetation",
+      "ingui": "stillgreenhouses:config-apply-other-vegetation",
+      "comment": "stillgreenhouses:config-apply-other-vegetation-comment",
+      "type": "boolean",
+      "default": true,
+      "clientSide": true
+    },
+    {
+      "code": "ApplyToGrass",
+      "ingui": "stillgreenhouses:config-apply-grass",
+      "comment": "stillgreenhouses:config-apply-grass-comment",
+      "type": "boolean",
+      "default": true,
+      "clientSide": true
+    },
+    {
+      "type": "separator",
+      "title": "stillgreenhouses:config-water-title"
+    },
+    {
+      "code": "ApplyToWater",
+      "ingui": "stillgreenhouses:config-apply-water",
+      "comment": "stillgreenhouses:config-apply-water-comment",
+      "type": "boolean",
+      "default": true,
+      "clientSide": true
+    }
+  ]
+}

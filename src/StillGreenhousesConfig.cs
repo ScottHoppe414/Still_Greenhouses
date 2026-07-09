@@ -53,7 +53,7 @@ public sealed class StillGreenhousesConfig
     // the original WindMode/WindData and supplies a room-local clone of
     // Vanilla's sustained 5% surface-wind shader state. Older nonzero mode
     // names are migrated to VanillaLowWind during config normalization.
-    public string GreenhouseWindMode { get; set; } = "VanillaLowWind";
+    public string GreenhouseWindMode { get; set; } = "NoWind";
 
     // Client-side room-type wind ranges, expressed as percentages of Vanilla's
     // surface-wind scale. 5 means 5%, or 0.05 in the shader.
