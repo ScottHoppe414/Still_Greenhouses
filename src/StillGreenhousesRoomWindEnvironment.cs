@@ -1,29 +1,40 @@
 /*
-version 0.10.16a
+version 0.18.0
 */
 
 using System;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Text;
 using System.Threading;
+using HarmonyLib;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
 using Vintagestory.API.MathTools;
 
 namespace StillGreenhouses;
 
-// 0.10.16a preserves every vegetation vertex's original Vanilla WindMode and
-// WindData, masks exact managed vegetation block positions, and supplies one
-// room-owned environmental wind state per ManagedRoomType.
+// 0.17.2 preserves every vegetation vertex's original Vanilla WindMode and
+// WindData, measures the actual local bounds of each mesh's wind-enabled
+// vertices, and supplies separate room-owned vegetation and water states per
+// ManagedRoomType.
 //
 // Vanilla applyVertexWarping() still performs the native per-mode deformation.
-// The active terrain call sites then pass that Vanilla result through a room
-// amplitude wrapper. Managed vertices keep their native movement profile while
-// the room scales the full Vanilla deformation delta by its own wind percent.
+// Managed vertices replace Vanilla's environmental wind speed and phase
+// counters before the native WindMode switch runs. Low Wind and No Wind share
+// this exact pipeline; the selected preset only chooses the vegetation range.
+// A zero-valued state explicitly zeroes every vegetation mode after the switch
+// because some Vanilla modes retain baseline motion at windSpeed zero.
+//
+// 0.18 rasterizes the measured envelopes into a dynamically sized quarter-
+// block RGBA8 hash texture. The vertex shader reconstructs absolute cells from
+// Vintage Story's render reference and resolves vegetation or water in at most
+// eight probes, without a nearest-128 selection or a per-vertex linear scan.
 //
 // All greenhouses share the Greenhouse state, all cellars share the Cellar
 // state, and all normal rooms share the Room state. Each state steps upward
@@ -75,21 +86,20 @@ internal static class StillGreenhousesRoomWindEnvironment
     internal static bool EnvironmentActive =>
         ShaderOverrideReady
         && CompiledBridgeVerified
-        && StillGreenhousesClientSystem
-            .PlantMovementMode
-            == RoomPlantMovementMode.VanillaLowWind;
+        && IsShaderDrivenMode(
+            StillGreenhousesClientSystem
+                .PlantMovementMode
+        );
 
     internal static bool ShouldUseRoomWindShader =>
         EnvironmentActive;
 
-    internal static string EffectiveWindTarget =>
-        StillGreenhousesClientSystem
-            .PlantMovementMode
-            == RoomPlantMovementMode.NoWind
-                ? RoomPlantMovementMode.NoWind.ToString()
-                : EnvironmentActive
-                    ? "VanillaNativeWarp@RoomTypeAmplitude/SharedStates"
-                    : "CompiledBridgeUnavailable/VanillaGlobalWind";
+    internal static bool IsShaderDrivenMode(
+        RoomPlantMovementMode movementMode
+    ) =>
+        movementMode is
+            RoomPlantMovementMode.VanillaNoWind
+            or RoomPlantMovementMode.VanillaLowWind;
 
     internal static int GetStateIndex(
         ManagedRoomType roomType
@@ -102,11 +112,32 @@ internal static class StillGreenhousesRoomWindEnvironment
             _ => 2
         };
 
+    internal static int GetStateIndex(
+        ManagedRoomType roomType,
+        RoomWindTargetKind target
+    ) =>
+        GetStateIndex(roomType)
+        + (
+            target == RoomWindTargetKind.Water
+                ? RoomTypeStateCount
+                : 0
+        );
+
     internal static RoomWindRange GetRange(
         StillGreenhousesConfig config,
-        ManagedRoomType roomType
+        ManagedRoomType roomType,
+        RoomWindTargetKind target = RoomWindTargetKind.Vegetation
     )
     {
+        if (
+            target == RoomWindTargetKind.Vegetation
+            && StillGreenhousesClientSystem.PlantMovementMode
+                == RoomPlantMovementMode.VanillaNoWind
+        )
+        {
+            return new RoomWindRange(0f, 0f);
+        }
+
         float lower;
         float upper;
 
@@ -114,28 +145,40 @@ internal static class StillGreenhousesRoomWindEnvironment
         {
             case ManagedRoomType.Greenhouse:
                 lower =
-                    config.GreenhouseWindLowerPercent;
+                    target == RoomWindTargetKind.Water
+                        ? config.GreenhouseWaterWindLowerPercent
+                        : config.GreenhouseWindLowerPercent;
 
                 upper =
-                    config.GreenhouseWindUpperPercent;
+                    target == RoomWindTargetKind.Water
+                        ? config.GreenhouseWaterWindUpperPercent
+                        : config.GreenhouseWindUpperPercent;
 
                 break;
 
             case ManagedRoomType.Cellar:
                 lower =
-                    config.CellarWindLowerPercent;
+                    target == RoomWindTargetKind.Water
+                        ? config.CellarWaterWindLowerPercent
+                        : config.CellarWindLowerPercent;
 
                 upper =
-                    config.CellarWindUpperPercent;
+                    target == RoomWindTargetKind.Water
+                        ? config.CellarWaterWindUpperPercent
+                        : config.CellarWindUpperPercent;
 
                 break;
 
             default:
                 lower =
-                    config.RoomWindLowerPercent;
+                    target == RoomWindTargetKind.Water
+                        ? config.RoomWaterWindLowerPercent
+                        : config.RoomWindLowerPercent;
 
                 upper =
-                    config.RoomWindUpperPercent;
+                    target == RoomWindTargetKind.Water
+                        ? config.RoomWaterWindUpperPercent
+                        : config.RoomWindUpperPercent;
 
                 break;
         }
@@ -167,13 +210,15 @@ internal static class StillGreenhousesRoomWindEnvironment
 
     internal static string DescribeRange(
         StillGreenhousesConfig config,
-        ManagedRoomType roomType
+        ManagedRoomType roomType,
+        RoomWindTargetKind target = RoomWindTargetKind.Vegetation
     )
     {
         RoomWindRange range =
             GetRange(
                 config,
-                roomType
+                roomType,
+                target
             );
 
         return
@@ -188,21 +233,10 @@ internal static class StillGreenhousesRoomWindEnvironment
             StillGreenhousesClientSystem.Config
             ?? new StillGreenhousesConfig();
 
-        if (
-            StillGreenhousesClientSystem
-                .PlantMovementMode
-                == RoomPlantMovementMode.NoWind
-        )
-        {
-            return RoomPlantMovementMode
-                .NoWind
-                .ToString();
-        }
-
         if (!EnvironmentActive)
         {
             return
-                "CompiledBridgeUnavailable/VanillaGlobalWind";
+                "CompiledBridgeUnavailable/VanillaWindFallback";
         }
 
         return
@@ -245,27 +279,216 @@ internal enum RoomWindTargetKind
     Water = 2
 }
 
+internal readonly record struct ManagedRoomWindEnvelope(
+    float MinX,
+    float MinY,
+    float MinZ,
+    float MaxX,
+    float MaxY,
+    float MaxZ
+)
+{
+    internal static ManagedRoomWindEnvelope UnitBlock { get; } =
+        new(
+            0f,
+            0f,
+            0f,
+            1f,
+            1f,
+            1f
+        );
+
+    internal float CenterX =>
+        (MinX + MaxX) * 0.5f;
+
+    internal float CenterY =>
+        (MinY + MaxY) * 0.5f;
+
+    internal float CenterZ =>
+        (MinZ + MaxZ) * 0.5f;
+
+    internal float HalfExtentX =>
+        Math.Max(
+            0f,
+            (MaxX - MinX) * 0.5f
+        );
+
+    internal float HalfExtentY =>
+        Math.Max(
+            0f,
+            (MaxY - MinY) * 0.5f
+        );
+
+    internal float HalfExtentZ =>
+        Math.Max(
+            0f,
+            (MaxZ - MinZ) * 0.5f
+        );
+
+    internal ManagedRoomWindEnvelope Union(
+        ManagedRoomWindEnvelope other
+    ) =>
+        new(
+            Math.Min(MinX, other.MinX),
+            Math.Min(MinY, other.MinY),
+            Math.Min(MinZ, other.MinZ),
+            Math.Max(MaxX, other.MaxX),
+            Math.Max(MaxY, other.MaxY),
+            Math.Max(MaxZ, other.MaxZ)
+        );
+
+    internal ManagedRoomWindEnvelope Translate(
+        float x,
+        float y,
+        float z
+    ) =>
+        new(
+            MinX + x,
+            MinY + y,
+            MinZ + z,
+            MaxX + x,
+            MaxY + y,
+            MaxZ + z
+        );
+
+}
+
+internal readonly record struct RoomWindRegistrationReconcileResult(
+    int RegisteredBefore,
+    int Retained,
+    int RoomTypeUpdated,
+    int RoomIdentityUpdated,
+    int Removed,
+    int WaterTargetsRemoved
+);
+
 internal readonly record struct ManagedRoomWindRegistration(
+    GreenhouseKey RoomKey,
     ManagedRoomType RoomType,
-    RoomWindTargetKind Targets
+    RoomWindTargetKind Targets,
+    ManagedRoomWindEnvelope VegetationEnvelope,
+    ManagedRoomWindEnvelope WaterEnvelope,
+    bool AllowRoomAbove,
+    bool AllowXRunCompaction
+)
+{
+    internal ManagedRoomWindEnvelope GetEnvelope(
+        RoomWindTargetKind targets
+    )
+    {
+        bool vegetation =
+            (
+                targets
+                & RoomWindTargetKind.Vegetation
+            ) != 0;
+
+        bool water =
+            (
+                targets
+                & RoomWindTargetKind.Water
+            ) != 0;
+
+        if (vegetation && water)
+        {
+            return VegetationEnvelope.Union(
+                WaterEnvelope
+            );
+        }
+
+        return vegetation
+            ? VegetationEnvelope
+            : WaterEnvelope;
+    }
+}
+
+internal readonly record struct CompactedPositionEnvelope(
+    ManagedVegetationShaderPosition Position,
+    GreenhouseKey RoomKey,
+    ManagedRoomType RoomType,
+    RoomWindTargetKind Targets,
+    ManagedRoomWindEnvelope Envelope,
+    int CoveredPositionCount
 );
 
 internal sealed class StillGreenhousesRoomWindUniformRenderer :
     IRenderer
 {
-    internal const int MaxUploadedPositions = 128;
+    // Legacy 0.17 uniform-array limits retained for rollback diagnostics and
+    // compaction checks. The active 0.18 renderer uses the dynamic cell hash
+    // and does not consult this budget.
+    internal static int ShaderPositionCapacity
+    {
+        get
+        {
+            StillGreenhousesConfig? config =
+                StillGreenhousesClientSystem.Config;
 
-    // First-pass fair budgets. Any unused slots are redistributed globally by
-    // nearest distance so all 128 uniforms can still be used.
-    internal const int GreenhouseReservedPositionBudget = 64;
-    internal const int CellarReservedPositionBudget = 32;
-    internal const int RoomReservedPositionBudget = 32;
+            if (config == null)
+            {
+                return StillGreenhousesConfig
+                    .DefaultAffectedPlantPositions;
+            }
 
-    // One state per ManagedRoomType:
-    // 0 = Greenhouse, 1 = Cellar, 2 = normal Room.
+            int maximum =
+                config.ExperimentalExtendedPositionCapacity
+                    ? StillGreenhousesConfig.MaximumAffectedPlantPositions
+                    : StillGreenhousesConfig.StandardMaximumAffectedPlantPositions;
+
+            return Math.Clamp(
+                config.MaxAffectedPlants,
+                StillGreenhousesConfig.MinimumAffectedPlantPositions,
+                maximum
+            );
+        }
+    }
+
+    internal static int ConfiguredPositionBudget =>
+        Math.Clamp(
+            StillGreenhousesClientSystem.Config?.MaxAffectedPlants
+                ?? StillGreenhousesConfig.DefaultAffectedPlantPositions,
+            StillGreenhousesConfig.MinimumAffectedPlantPositions,
+            ShaderPositionCapacity
+        );
+
+    internal static int GreenhouseReservedPositionBudget =>
+        CalculateReservedPositionBudgets(
+            ConfiguredPositionBudget
+        ).Greenhouse;
+
+    internal static int CellarReservedPositionBudget =>
+        CalculateReservedPositionBudgets(
+            ConfiguredPositionBudget
+        ).Cellar;
+
+    internal static int RoomReservedPositionBudget =>
+        CalculateReservedPositionBudgets(
+            ConfiguredPositionBudget
+        ).Room;
+
+    // Two states per ManagedRoomType. Indices 0..2 are vegetation and 3..5 are
+    // water, each ordered Greenhouse, Cellar, normal Room.
     internal const int UploadedRoomTypeStateCount =
         StillGreenhousesRoomWindEnvironment
-            .RoomTypeStateCount;
+            .RoomTypeStateCount * 2;
+
+    // One vec4 per room type. Position transport now uses Vintage Story's own
+    // playerReferencePos-relative render coordinate space, so no custom
+    // reference metadata vector is required.
+    internal const int UploadedShaderStateVectorCount =
+        UploadedRoomTypeStateCount;
+
+    // Wind-vertex envelopes are measured from the actual tessellated mesh.
+    // Half extents are quantized into six bits per axis at 1/8-block steps and
+    // packed with room/target metadata into the exactly representable integer
+    // range of a GLSL float.
+    internal const float EnvelopeExtentQuantization = 0.125f;
+    internal const float EnvelopeMeasurementPadding = 0.0625f;
+    internal const int EnvelopeExtentBits = 6;
+    internal const int EnvelopeExtentMask =
+        (1 << EnvelopeExtentBits) - 1;
+    internal const int PackedTargetBits = 4;
+    internal const int PackedTargetMask =
+        (1 << PackedTargetBits) - 1;
 
     // A one-percentage-point triangular step every 12 scaled game seconds.
     // Ranges narrower than 1% use the full configured span as their step.
@@ -273,23 +496,45 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
         12f;
 
     private const int SnapshotRefreshMs = 250;
-    private const int ProgramRediscoveryMs = 1000;
+    private const int CellHashRegistrationDebounceMs = 250;
+    private const int CellHashTextureUnit = 15;
+    private const int ProgramRecoveryRediscoveryMs = 5000;
+    private const double TopologyMovementThresholdBlocks = 1d;
+    private const double TopologyMovementThresholdSquared =
+        TopologyMovementThresholdBlocks * TopologyMovementThresholdBlocks;
+
+    // Overlap safety is evaluated only when registration topology changes.
+    // Four-block cells keep dense 32^3 rooms near linear-local work instead
+    // of placing every descriptor in one chunk-sized comparison bucket.
+    private const double CompactionOverlapBucketSizeBlocks = 4d;
 
     private static readonly EnumShaderProgram[] TargetPrograms =
     [
-        // Active vegetation consumers. The supplied Vanilla top-level shaders
-        // call applyVertexWarping() in these passes.
+        // Active terrain vegetation consumers. The supplied Vanilla top-level
+        // shaders call applyVertexWarping() in these passes.
         EnumShaderProgram.Chunkopaque,
         EnumShaderProgram.Chunktransparent,
         EnumShaderProgram.Chunkshadowmap,
         EnumShaderProgram.Chunkshadowmap_NoSSBOs,
+
+        // Auxiliary Vanilla consumers also include vertexwarp.vsh and call
+        // applyVertexWarping(). They are optional for core terrain readiness,
+        // but receive the same room position/state uniforms when available.
+        EnumShaderProgram.Standard,
+        EnumShaderProgram.Entityanimated,
+        EnumShaderProgram.Shadowmapentityanimated,
+        EnumShaderProgram.Entityanimated_Oit,
 
         // Liquid consumers use the separately patched applyLiquidWarping().
         EnumShaderProgram.Chunkliquid,
         EnumShaderProgram.Chunkliquiddepth
     ];
 
-    internal const int VegetationTargetProgramCount = 4;
+    internal const int TerrainVegetationTargetProgramCount = 4;
+    internal const int AuxiliaryVegetationTargetProgramCount = 4;
+    internal const int VegetationTargetProgramCount =
+        TerrainVegetationTargetProgramCount
+        + AuxiliaryVegetationTargetProgramCount;
     internal const int LiquidTargetProgramCount = 2;
 
     private static readonly ConcurrentDictionary<
@@ -312,25 +557,77 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
     private static int uploadedCellarPositionCount;
     private static int uploadedRoomPositionCount;
     private static int validPositionCount;
+    private static int compactedEnvelopeCount;
+    private static int uploadedCoveredPositionCount;
     private static int uploadedRoomStateCount;
     private static int activeProgramCount;
     private static int activeVegetationProgramCount;
+    private static int activeTerrainVegetationProgramCount;
+    private static int activeAuxiliaryVegetationProgramCount;
     private static int activeLiquidProgramCount;
     private static int requiredChunkOpaqueBound;
     private static int snapshotRevision;
     private static int uniformBridgeReady;
+    private static int registrationRevision;
+
+    private static long topologyRefreshRuns;
+    private static long topologyRefreshSkips;
+    private static long topologyCandidatesEvaluated;
+    private static long programDiscoveryRuns;
+    private static long uniformUploadRuns;
+    private static long uniformProgramBindOperations;
+
+    private static long lastTopologyRefreshMicroseconds;
+    private static long maxTopologyRefreshMicroseconds;
+    private static long lastProgramDiscoveryMicroseconds;
+    private static long maxProgramDiscoveryMicroseconds;
+    private static long lastUniformUploadMicroseconds;
+    private static long maxUniformUploadMicroseconds;
+
+    private static string lastUniformUploadFailure =
+        "<none>";
 
     private static float greenhouseCurrentPercent;
     private static float cellarCurrentPercent;
     private static float roomCurrentPercent;
+    private static float greenhouseWaterCurrentPercent;
+    private static float cellarWaterCurrentPercent;
+    private static float roomWaterCurrentPercent;
 
     private readonly ICoreClientAPI api;
-
     private readonly RoomWindRuntimeState[]
         roomTypeStates;
 
     private readonly List<ShaderProgramBinding>
         programBindings = new();
+
+    private readonly float[] stateValueBuffer =
+        new float[UploadedShaderStateVectorCount * 4];
+
+    // 0.18.0 replaces the per-vertex linear envelope scan with a bounded-probe
+    // texture hash. The texture is rebuilt only after registration topology has
+    // been stable for one refresh interval; ordinary player movement never
+    // changes it.
+    private RoomWindCellHashSnapshot cellHashSnapshot =
+        RoomWindCellHash.Build(
+            Array.Empty<RoomWindCellContribution>()
+        );
+
+    private LoadedTexture? cellHashTexture;
+    private int cellHashRevision;
+    private int lastBuiltHashRegistrationRevision = int.MinValue;
+    private int lastBuiltHashDimension = int.MinValue;
+    private int pendingHashRegistrationRevision = int.MinValue;
+    private int pendingHashDimension = int.MinValue;
+    private long pendingHashSinceMs;
+    private int stateRevision = 1;
+    private int renderReferenceRevision = 1;
+    private int renderReferenceQuarterX;
+    private int renderReferenceQuarterY;
+    private int renderReferenceQuarterZ;
+    private float renderReferenceQuarterFractionX;
+    private float renderReferenceQuarterFractionY;
+    private float renderReferenceQuarterFractionZ;
 
     private RoomWindTopologySnapshot topology =
         RoomWindTopologySnapshot.Empty;
@@ -340,7 +637,44 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
     private int lastProgramDiagnosticHash =
         int.MinValue;
 
+    private int lastObservedRegistrationRevision =
+        int.MinValue;
+
+    private int lastObservedPositionBudget =
+        -1;
+
+    private int compactedRegistrationRevision =
+        int.MinValue;
+
+    private List<CompactedPositionEnvelope>
+        compactedRegistrations = new();
+
+    private double lastSelectionPlayerX =
+        double.NaN;
+
+    private double lastSelectionPlayerY =
+        double.NaN;
+
+    private double lastSelectionPlayerZ =
+        double.NaN;
+
+    private int lastSelectionPlayerDimension =
+        int.MinValue;
+
+    private double lastRenderReferenceX =
+        double.NaN;
+
+    private double lastRenderReferenceY =
+        double.NaN;
+
+    private double lastRenderReferenceZ =
+        double.NaN;
+
+    private bool lastRenderReferenceAvailable;
+    private bool topologyRefreshInitialized;
     private int disposed;
+    private int positionLimitWarningLogged;
+    private int compactionFailureWarningLogged;
 
     internal static int RegisteredPositionCount =>
         RegisteredPositions.Count;
@@ -370,6 +704,16 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
             ref validPositionCount
         );
 
+    internal static int CompactedEnvelopeCount =>
+        Volatile.Read(
+            ref compactedEnvelopeCount
+        );
+
+    internal static int UploadedCoveredPositionCount =>
+        Volatile.Read(
+            ref uploadedCoveredPositionCount
+        );
+
     internal static int UploadedRoomStateCount =>
         Volatile.Read(
             ref uploadedRoomStateCount
@@ -383,6 +727,16 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
     internal static int ActiveVegetationProgramCount =>
         Volatile.Read(
             ref activeVegetationProgramCount
+        );
+
+    internal static int ActiveTerrainVegetationProgramCount =>
+        Volatile.Read(
+            ref activeTerrainVegetationProgramCount
+        );
+
+    internal static int ActiveAuxiliaryVegetationProgramCount =>
+        Volatile.Read(
+            ref activeAuxiliaryVegetationProgramCount
         );
 
     internal static int ActiveLiquidProgramCount =>
@@ -400,10 +754,80 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
             ref uniformBridgeReady
         ) != 0;
 
+    internal static string LastUniformUploadFailure =>
+        Volatile.Read(
+            ref lastUniformUploadFailure
+        );
+
     internal static int SnapshotRevision =>
         Volatile.Read(
             ref snapshotRevision
         );
+
+    internal static int RegistrationRevision =>
+        Volatile.Read(
+            ref registrationRevision
+        );
+
+    internal static long TopologyRefreshRuns =>
+        Interlocked.Read(
+            ref topologyRefreshRuns
+        );
+
+    internal static long TopologyRefreshSkips =>
+        Interlocked.Read(
+            ref topologyRefreshSkips
+        );
+
+    internal static long TopologyCandidatesEvaluated =>
+        Interlocked.Read(
+            ref topologyCandidatesEvaluated
+        );
+
+    internal static long ProgramDiscoveryRuns =>
+        Interlocked.Read(
+            ref programDiscoveryRuns
+        );
+
+    internal static long UniformUploadRuns =>
+        Interlocked.Read(
+            ref uniformUploadRuns
+        );
+
+    internal static long UniformProgramBindOperations =>
+        Interlocked.Read(
+            ref uniformProgramBindOperations
+        );
+
+    internal static double LastTopologyRefreshMs =>
+        Interlocked.Read(
+            ref lastTopologyRefreshMicroseconds
+        ) / 1000d;
+
+    internal static double MaxTopologyRefreshMs =>
+        Interlocked.Read(
+            ref maxTopologyRefreshMicroseconds
+        ) / 1000d;
+
+    internal static double LastProgramDiscoveryMs =>
+        Interlocked.Read(
+            ref lastProgramDiscoveryMicroseconds
+        ) / 1000d;
+
+    internal static double MaxProgramDiscoveryMs =>
+        Interlocked.Read(
+            ref maxProgramDiscoveryMicroseconds
+        ) / 1000d;
+
+    internal static double LastUniformUploadMs =>
+        Interlocked.Read(
+            ref lastUniformUploadMicroseconds
+        ) / 1000d;
+
+    internal static double MaxUniformUploadMs =>
+        Interlocked.Read(
+            ref maxUniformUploadMicroseconds
+        ) / 1000d;
 
     internal static int TargetProgramCount =>
         TargetPrograms.Length;
@@ -423,6 +847,21 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
             ref roomCurrentPercent
         );
 
+    internal static float GreenhouseWaterCurrentPercent =>
+        Volatile.Read(
+            ref greenhouseWaterCurrentPercent
+        );
+
+    internal static float CellarWaterCurrentPercent =>
+        Volatile.Read(
+            ref cellarWaterCurrentPercent
+        );
+
+    internal static float RoomWaterCurrentPercent =>
+        Volatile.Read(
+            ref roomWaterCurrentPercent
+        );
+
     public double RenderOrder => 0.99d;
 
     public int RenderRange => int.MaxValue;
@@ -432,6 +871,11 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
     )
     {
         this.api = api;
+
+        Volatile.Write(
+            ref lastUniformUploadFailure,
+            "<none>"
+        );
 
         StillGreenhousesConfig config =
             StillGreenhousesClientSystem.Config
@@ -445,12 +889,14 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
             CreateRoomTypeState(
                 config,
                 ManagedRoomType.Greenhouse,
+                RoomWindTargetKind.Vegetation,
                 uniforms,
                 phaseOffsetSeconds: 0f
             ),
             CreateRoomTypeState(
                 config,
                 ManagedRoomType.Cellar,
+                RoomWindTargetKind.Vegetation,
                 uniforms,
                 phaseOffsetSeconds:
                     AmbientWindStepIntervalSeconds / 3f
@@ -458,6 +904,30 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
             CreateRoomTypeState(
                 config,
                 ManagedRoomType.Room,
+                RoomWindTargetKind.Vegetation,
+                uniforms,
+                phaseOffsetSeconds:
+                    AmbientWindStepIntervalSeconds * 2f / 3f
+            ),
+            CreateRoomTypeState(
+                config,
+                ManagedRoomType.Greenhouse,
+                RoomWindTargetKind.Water,
+                uniforms,
+                phaseOffsetSeconds: 0f
+            ),
+            CreateRoomTypeState(
+                config,
+                ManagedRoomType.Cellar,
+                RoomWindTargetKind.Water,
+                uniforms,
+                phaseOffsetSeconds:
+                    AmbientWindStepIntervalSeconds / 3f
+            ),
+            CreateRoomTypeState(
+                config,
+                ManagedRoomType.Room,
+                RoomWindTargetKind.Water,
                 uniforms,
                 phaseOffsetSeconds:
                     AmbientWindStepIntervalSeconds * 2f / 3f
@@ -474,6 +944,7 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
             StillGreenhousesClientSystem.DebugLiteral(
                 "[StillGreenhouses] ROOM TYPE WIND STATE CREATED " +
                 $"roomType={state.RoomType}; " +
+                $"target={state.Target}; " +
                 $"range={state.LowerPercent:0.###}-{state.UpperPercent:0.###}%; " +
                 $"fixed={state.IsFixed}; " +
                 $"currentPercent={state.CurrentPercent:0.###}; " +
@@ -488,6 +959,7 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
     private static RoomWindRuntimeState CreateRoomTypeState(
         StillGreenhousesConfig config,
         ManagedRoomType roomType,
+        RoomWindTargetKind target,
         DefaultShaderUniforms uniforms,
         float phaseOffsetSeconds
     )
@@ -496,11 +968,13 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
             StillGreenhousesRoomWindEnvironment
                 .GetRange(
                     config,
-                    roomType
+                    roomType,
+                    target
                 );
 
         return new RoomWindRuntimeState(
             roomType,
+            target,
             range,
             uniforms.WindWaveCounter,
             uniforms.WindWaveCounterHighFreq,
@@ -508,14 +982,158 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
         );
     }
 
+    internal static bool TryMeasureWindVertexEnvelope(
+        MeshData mesh,
+        out ManagedRoomWindEnvelope allVertexEnvelope,
+        out ManagedRoomWindEnvelope windVertexEnvelope,
+        out int measuredVertexCount,
+        out int windVertexCount
+    )
+    {
+        allVertexEnvelope = default;
+        windVertexEnvelope = default;
+        measuredVertexCount = 0;
+        windVertexCount = 0;
+
+        if (
+            mesh.xyz == null
+            || mesh.Flags == null
+        )
+        {
+            return false;
+        }
+
+        int vertexCount = Math.Min(
+            mesh.VerticesCount,
+            Math.Min(
+                mesh.Flags.Length,
+                mesh.xyz.Length / 3
+            )
+        );
+
+        bool allInitialized = false;
+        bool windInitialized = false;
+
+        float allMinX = 0f;
+        float allMinY = 0f;
+        float allMinZ = 0f;
+        float allMaxX = 0f;
+        float allMaxY = 0f;
+        float allMaxZ = 0f;
+
+        float windMinX = 0f;
+        float windMinY = 0f;
+        float windMinZ = 0f;
+        float windMaxX = 0f;
+        float windMaxY = 0f;
+        float windMaxZ = 0f;
+
+        for (int vertex = 0; vertex < vertexCount; vertex++)
+        {
+            int xyzOffset = vertex * 3;
+
+            float x = mesh.xyz[xyzOffset];
+            float y = mesh.xyz[xyzOffset + 1];
+            float z = mesh.xyz[xyzOffset + 2];
+
+            if (
+                !float.IsFinite(x)
+                || !float.IsFinite(y)
+                || !float.IsFinite(z)
+            )
+            {
+                continue;
+            }
+
+            measuredVertexCount++;
+
+            if (!allInitialized)
+            {
+                allMinX = allMaxX = x;
+                allMinY = allMaxY = y;
+                allMinZ = allMaxZ = z;
+                allInitialized = true;
+            }
+            else
+            {
+                allMinX = Math.Min(allMinX, x);
+                allMinY = Math.Min(allMinY, y);
+                allMinZ = Math.Min(allMinZ, z);
+                allMaxX = Math.Max(allMaxX, x);
+                allMaxY = Math.Max(allMaxY, y);
+                allMaxZ = Math.Max(allMaxZ, z);
+            }
+
+            if (
+                (
+                    mesh.Flags[vertex]
+                    & VertexFlags.WindModeBitsMask
+                ) == 0
+            )
+            {
+                continue;
+            }
+
+            windVertexCount++;
+
+            if (!windInitialized)
+            {
+                windMinX = windMaxX = x;
+                windMinY = windMaxY = y;
+                windMinZ = windMaxZ = z;
+                windInitialized = true;
+            }
+            else
+            {
+                windMinX = Math.Min(windMinX, x);
+                windMinY = Math.Min(windMinY, y);
+                windMinZ = Math.Min(windMinZ, z);
+                windMaxX = Math.Max(windMaxX, x);
+                windMaxY = Math.Max(windMaxY, y);
+                windMaxZ = Math.Max(windMaxZ, z);
+            }
+        }
+
+        if (!allInitialized || !windInitialized)
+        {
+            return false;
+        }
+
+        allVertexEnvelope = new ManagedRoomWindEnvelope(
+            allMinX,
+            allMinY,
+            allMinZ,
+            allMaxX,
+            allMaxY,
+            allMaxZ
+        );
+
+        windVertexEnvelope = new ManagedRoomWindEnvelope(
+            windMinX,
+            windMinY,
+            windMinZ,
+            windMaxX,
+            windMaxY,
+            windMaxZ
+        );
+
+        return true;
+    }
+
     internal static void RegisterPosition(
         BlockPos pos,
-        GreenhouseRegion room
+        GreenhouseRegion room,
+        ManagedRoomWindEnvelope windVertexEnvelope,
+        bool allowRoomAbove = false,
+        bool allowXRunCompaction = false
     ) =>
         RegisterTargetPosition(
             pos,
             room,
-            RoomWindTargetKind.Vegetation
+            RoomWindTargetKind.Vegetation,
+            windVertexEnvelope,
+            allowRoomAbove,
+            allowXRunCompaction
         );
 
     internal static void RegisterWaterPosition(
@@ -525,22 +1143,31 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
         RegisterTargetPosition(
             pos,
             room,
-            RoomWindTargetKind.Water
+            RoomWindTargetKind.Water,
+            ManagedRoomWindEnvelope.UnitBlock,
+            allowRoomAbove: false,
+            allowXRunCompaction: true
         );
 
     private static void RegisterTargetPosition(
         BlockPos pos,
         GreenhouseRegion room,
-        RoomWindTargetKind target
+        RoomWindTargetKind target,
+        ManagedRoomWindEnvelope envelope,
+        bool allowRoomAbove,
+        bool allowXRunCompaction
     )
     {
-        if (
+        RoomPlantMovementMode movementMode =
             StillGreenhousesClientSystem
-                .PlantMovementMode
-                != RoomPlantMovementMode.VanillaLowWind
+                .PlantMovementMode;
+
+        if (
+            !StillGreenhousesRoomWindEnvironment
+                .IsShaderDrivenMode(movementMode)
         )
         {
-            RemovePosition(pos);
+            RemoveTargetPosition(pos, target);
 
             return;
         }
@@ -553,19 +1180,104 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
 
         lock (RegistrationSync)
         {
-            RegisteredPositions.AddOrUpdate(
-                key,
-                _ =>
-                    new ManagedRoomWindRegistration(
-                        room.RoomType,
-                        target
-                    ),
-                (_, existing) =>
-                    new ManagedRoomWindRegistration(
-                        room.RoomType,
-                        existing.Targets | target
-                    )
-            );
+            bool hadExisting =
+                RegisteredPositions.TryGetValue(
+                    key,
+                    out ManagedRoomWindRegistration existingBefore
+                );
+
+            ManagedRoomWindRegistration updated;
+
+            if (!hadExisting)
+            {
+                updated = new ManagedRoomWindRegistration(
+                    room.Key,
+                    room.RoomType,
+                    target,
+                    target == RoomWindTargetKind.Vegetation
+                        ? envelope
+                        : default,
+                    target == RoomWindTargetKind.Water
+                        ? envelope
+                        : default,
+                    target == RoomWindTargetKind.Vegetation
+                        && allowRoomAbove,
+                    allowXRunCompaction
+                        && !allowRoomAbove
+                );
+            }
+            else
+            {
+                bool hadVegetation =
+                    (
+                        existingBefore.Targets
+                        & RoomWindTargetKind.Vegetation
+                    ) != 0;
+
+                ManagedRoomWindEnvelope vegetationEnvelope =
+                    target == RoomWindTargetKind.Vegetation
+                        ? hadVegetation
+                            ? existingBefore.VegetationEnvelope.Union(
+                                envelope
+                            )
+                            : envelope
+                        : existingBefore.VegetationEnvelope;
+
+                if (
+                    target == RoomWindTargetKind.Vegetation
+                    && hadVegetation
+                    && vegetationEnvelope
+                        != existingBefore.VegetationEnvelope
+                    && StillGreenhousesClientSystem.Config
+                        ?.DebugLogging == true
+                )
+                {
+                    StillGreenhousesClientSystem.DebugLiteral(
+                        "[StillGreenhouses] ROOM WIND REGISTRATION MERGE "
+                        + $"pos={key.X},{key.Y},{key.Z}; "
+                        + $"dim={key.Dimension}; "
+                        + $"oldEnvelope={FormatEnvelope(existingBefore.VegetationEnvelope)}; "
+                        + $"newEnvelope={FormatEnvelope(envelope)}; "
+                        + $"mergedEnvelope={FormatEnvelope(vegetationEnvelope)}"
+                    );
+                }
+
+                updated = existingBefore with
+                {
+                    RoomKey = room.Key,
+                    RoomType = room.RoomType,
+                    Targets = existingBefore.Targets | target,
+                    VegetationEnvelope = vegetationEnvelope,
+                    WaterEnvelope =
+                        target == RoomWindTargetKind.Water
+                            ? envelope
+                            : existingBefore.WaterEnvelope,
+                    AllowRoomAbove =
+                        existingBefore.AllowRoomAbove
+                        || (
+                            target == RoomWindTargetKind.Vegetation
+                            && allowRoomAbove
+                        ),
+                    // A second, different registration at the same block can
+                    // represent a multipart mesh or a mixed water/vegetation
+                    // target. Keep those one-for-one for the conservative
+                    // compaction path.
+                    AllowXRunCompaction =
+                        existingBefore.AllowXRunCompaction
+                        && allowXRunCompaction
+                        && !allowRoomAbove
+                        && existingBefore.RoomKey == room.Key
+                        && existingBefore.RoomType == room.RoomType
+                        && existingBefore.Targets == target
+                        && (
+                            target == RoomWindTargetKind.Water
+                                ? existingBefore.WaterEnvelope == envelope
+                                : existingBefore.VegetationEnvelope == envelope
+                        )
+                };
+            }
+
+            RegisteredPositions[key] = updated;
 
             RegisteredPositionsByChunk
                 .GetOrAdd(
@@ -575,7 +1287,99 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
                         byte
                     >()
                 )[key] = 0;
+
+            if (
+                !hadExisting
+                || updated != existingBefore
+            )
+            {
+                Interlocked.Increment(
+                    ref registrationRevision
+                );
+            }
         }
+    }
+
+    private static string FormatEnvelope(
+        ManagedRoomWindEnvelope envelope
+    ) =>
+        FormattableString.Invariant(
+            $"[{envelope.MinX:0.###},{envelope.MinY:0.###},{envelope.MinZ:0.###}..{envelope.MaxX:0.###},{envelope.MaxY:0.###},{envelope.MaxZ:0.###}]"
+        );
+
+    internal static bool HasRegisteredVegetationPositionAffectedByMembership(
+        BlockPos membershipPos
+    )
+    {
+        ManagedVegetationShaderPosition exactKey =
+            ManagedVegetationShaderPosition.From(
+                membershipPos
+            );
+
+        if (RegisteredPositions.TryGetValue(
+                exactKey,
+                out ManagedRoomWindRegistration exactRegistration
+            )
+            && (
+                exactRegistration.Targets
+                & RoomWindTargetKind.Vegetation
+            ) != 0)
+        {
+            return true;
+        }
+
+        ManagedVegetationShaderPosition belowKey =
+            ManagedVegetationShaderPosition.From(
+                membershipPos.DownCopy()
+            );
+
+        return RegisteredPositions.TryGetValue(
+                   belowKey,
+                   out ManagedRoomWindRegistration belowRegistration
+               )
+               && belowRegistration.AllowRoomAbove
+               && (
+                   belowRegistration.Targets
+                   & RoomWindTargetKind.Vegetation
+               ) != 0;
+    }
+
+    internal static bool HasRegisteredVegetationPositionsForChunk(
+        ChunkKey chunkKey
+    )
+    {
+        if (!RegisteredPositionsByChunk.TryGetValue(
+                chunkKey,
+                out ConcurrentDictionary<
+                    ManagedVegetationShaderPosition,
+                    byte
+                >? index
+            ))
+        {
+            return false;
+        }
+
+        foreach (
+            ManagedVegetationShaderPosition position
+            in index.Keys
+        )
+        {
+            if (
+                RegisteredPositions.TryGetValue(
+                    position,
+                    out ManagedRoomWindRegistration registration
+                )
+                && (
+                    registration.Targets
+                    & RoomWindTargetKind.Vegetation
+                ) != 0
+            )
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     internal static void RemovePosition(
@@ -584,6 +1388,93 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
         RemoveRegisteredPosition(
             ManagedVegetationShaderPosition.From(pos)
         );
+
+    internal static void RemoveWaterPosition(
+        BlockPos pos
+    ) =>
+        RemoveTargetPosition(
+            pos,
+            RoomWindTargetKind.Water
+        );
+
+    private static bool RemoveTargetPosition(
+        BlockPos pos,
+        RoomWindTargetKind target
+    )
+    {
+        ManagedVegetationShaderPosition position =
+            ManagedVegetationShaderPosition.From(pos);
+
+        lock (RegistrationSync)
+        {
+            if (!RegisteredPositions.TryGetValue(
+                    position,
+                    out ManagedRoomWindRegistration registration
+                )
+                || (
+                    registration.Targets
+                    & target
+                ) == 0)
+            {
+                return false;
+            }
+
+            RoomWindTargetKind remainingTargets =
+                registration.Targets
+                & ~target;
+
+            if (remainingTargets == RoomWindTargetKind.None)
+            {
+                return RemoveRegisteredPosition(
+                    position
+                );
+            }
+
+            bool vegetationRemaining =
+                (
+                    remainingTargets
+                    & RoomWindTargetKind.Vegetation
+                ) != 0;
+
+            bool waterRemaining =
+                (
+                    remainingTargets
+                    & RoomWindTargetKind.Water
+                ) != 0;
+
+            RegisteredPositions[position] =
+                registration with
+                {
+                    Targets = remainingTargets,
+                    VegetationEnvelope =
+                        vegetationRemaining
+                            ? registration.VegetationEnvelope
+                            : default,
+                    WaterEnvelope =
+                        waterRemaining
+                            ? registration.WaterEnvelope
+                            : default,
+                    AllowRoomAbove =
+                        vegetationRemaining
+                        && registration.AllowRoomAbove,
+                    // Water registrations always use unit-block X-run
+                    // compaction. If vegetation remains, retain its existing
+                    // conservative eligibility instead of guessing after a
+                    // mixed registration has been split.
+                    AllowXRunCompaction =
+                        waterRemaining
+                        && !vegetationRemaining
+                            ? true
+                            : registration.AllowXRunCompaction
+                };
+
+            Interlocked.Increment(
+                ref registrationRevision
+            );
+
+            return true;
+        }
+    }
 
     private static bool RemoveRegisteredPosition(
         ManagedVegetationShaderPosition position
@@ -596,6 +1487,11 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
                     position,
                     out _
                 );
+
+            if (!removed)
+            {
+                return false;
+            }
 
             ChunkKey chunkKey =
                 ChunkKey.From(
@@ -626,7 +1522,246 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
                 }
             }
 
-            return removed;
+            Interlocked.Increment(
+                ref registrationRevision
+            );
+
+            return true;
+        }
+    }
+
+    internal static RoomWindRegistrationReconcileResult
+        ReconcilePositionsForChunk(
+            ChunkKey chunkKey
+        )
+    {
+        lock (RegistrationSync)
+        {
+            if (!RegisteredPositionsByChunk.TryGetValue(
+                    chunkKey,
+                    out ConcurrentDictionary<
+                        ManagedVegetationShaderPosition,
+                        byte
+                    >? index
+                ))
+            {
+                return default;
+            }
+
+            int registeredBefore = index.Count;
+            int retained = 0;
+            int roomTypeUpdated = 0;
+            int roomIdentityUpdated = 0;
+            int removed = 0;
+            int waterTargetsRemoved = 0;
+
+            ICoreClientAPI? clientApi =
+                StillGreenhousesClientSystem.Capi;
+
+            bool waterPipelineEnabled =
+                StillGreenhousesClientSystem.Config
+                    ?.ApplyToWater == true
+                && StillGreenhousesRoomWindEnvironment
+                    .IsShaderDrivenMode(
+                        StillGreenhousesClientSystem
+                            .PlantMovementMode
+                    );
+
+            foreach (
+                ManagedVegetationShaderPosition position
+                in index.Keys
+            )
+            {
+                if (!RegisteredPositions.TryGetValue(
+                        position,
+                        out ManagedRoomWindRegistration registration
+                    ))
+                {
+                    index.TryRemove(position, out _);
+                    continue;
+                }
+
+                BlockPos blockPos = position.ToBlockPos();
+
+                bool hasWaterTarget =
+                    (
+                        registration.Targets
+                        & RoomWindTargetKind.Water
+                    ) != 0;
+
+                if (
+                    hasWaterTarget
+                    && clientApi != null
+                    && (
+                        !waterPipelineEnabled
+                        || !StillGreenhousesShared
+                            .IsWaterSurfaceSourceBlock(
+                                clientApi.World.BlockAccessor,
+                                blockPos
+                            )
+                    )
+                )
+                {
+                    RoomWindTargetKind remainingTargets =
+                        registration.Targets
+                        & ~RoomWindTargetKind.Water;
+
+                    waterTargetsRemoved++;
+
+                    if (
+                        remainingTargets
+                        == RoomWindTargetKind.None
+                    )
+                    {
+                        if (RegisteredPositions.TryRemove(
+                                position,
+                                out _
+                            ))
+                        {
+                            removed++;
+                        }
+
+                        index.TryRemove(position, out _);
+                        continue;
+                    }
+
+                    registration = registration with
+                    {
+                        Targets = remainingTargets,
+                        WaterEnvelope = default
+                    };
+
+                    RegisteredPositions[position] =
+                        registration;
+                }
+
+                bool hasVegetationTarget =
+                    (
+                        registration.Targets
+                        & RoomWindTargetKind.Vegetation
+                    ) != 0;
+
+                GreenhouseRegion? room;
+                bool roomResolved;
+
+                if (
+                    hasVegetationTarget
+                    && registration.AllowRoomAbove
+                )
+                {
+                    roomResolved =
+                        StillGreenhousesClientSystem
+                            .TryGetCachedWindMeshRoom(
+                                blockPos,
+                                requestIfUnknown: false,
+                                out room
+                            );
+                }
+                else
+                {
+                    roomResolved =
+                        StillGreenhousesClientSystem
+                            .TryGetCachedGreenhouse(
+                                blockPos,
+                                requestIfUnknown: false,
+                                out room
+                            );
+                }
+
+                if (!roomResolved || room == null)
+                {
+                    if (RegisteredPositions.TryRemove(position, out _))
+                    {
+                        removed++;
+                    }
+
+                    index.TryRemove(position, out _);
+                    continue;
+                }
+
+                retained++;
+
+                bool roomTypeChanged =
+                    registration.RoomType != room.RoomType;
+
+                bool roomIdentityChanged =
+                    registration.RoomKey != room.Key;
+
+                if (
+                    !roomTypeChanged
+                    && !roomIdentityChanged
+                )
+                {
+                    continue;
+                }
+
+                RegisteredPositions[position] =
+                    registration with
+                    {
+                        RoomKey = room.Key,
+                        RoomType = room.RoomType
+                    };
+
+                if (roomTypeChanged)
+                {
+                    roomTypeUpdated++;
+                }
+
+                if (roomIdentityChanged)
+                {
+                    roomIdentityUpdated++;
+                }
+            }
+
+            if (index.IsEmpty)
+            {
+                RegisteredPositionsByChunk.TryRemove(
+                    chunkKey,
+                    out _
+                );
+            }
+
+            RoomWindRegistrationReconcileResult result = new(
+                registeredBefore,
+                retained,
+                roomTypeUpdated,
+                roomIdentityUpdated,
+                removed,
+                waterTargetsRemoved
+            );
+
+            if (
+                roomTypeUpdated > 0
+                || roomIdentityUpdated > 0
+                || removed > 0
+                || waterTargetsRemoved > 0
+            )
+            {
+                Interlocked.Increment(
+                    ref registrationRevision
+                );
+            }
+
+            if (
+                StillGreenhousesClientSystem.Config
+                    ?.DebugLogging == true
+                && registeredBefore > 0
+            )
+            {
+                StillGreenhousesClientSystem.DebugLiteral(
+                    "[StillGreenhouses] CLIENT ROOM WIND RECONCILE " +
+                    $"chunk={chunkKey.X},{chunkKey.Y},{chunkKey.Z}; " +
+                    $"dim={chunkKey.Dimension}; " +
+                    $"registeredBefore={result.RegisteredBefore}; " +
+                    $"retained={result.Retained}; " +
+                    $"roomTypeUpdated={result.RoomTypeUpdated}; " +
+                    $"roomIdentityUpdated={result.RoomIdentityUpdated}; " +
+                    $"removed={result.Removed}; " +
+                    $"waterTargetsRemoved={result.WaterTargetsRemoved}"
+                );
+            }
+
+            return result;
         }
     }
 
@@ -663,6 +1798,13 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
                 }
             }
 
+            if (removed > 0)
+            {
+                Interlocked.Increment(
+                    ref registrationRevision
+                );
+            }
+
             return removed;
         }
     }
@@ -673,6 +1815,10 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
         {
             RegisteredPositions.Clear();
             RegisteredPositionsByChunk.Clear();
+
+            Interlocked.Increment(
+                ref registrationRevision
+            );
         }
 
         Volatile.Write(
@@ -701,9 +1847,74 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
         );
 
         Volatile.Write(
+            ref compactedEnvelopeCount,
+            0
+        );
+
+        Volatile.Write(
+            ref uploadedCoveredPositionCount,
+            0
+        );
+
+        Volatile.Write(
             ref uploadedRoomStateCount,
             0
         );
+    }
+
+    internal void PrepareForWorldTransition()
+    {
+        programBindings.Clear();
+        topology = RoomWindTopologySnapshot.Empty;
+        nextSnapshotRefreshMs = 0;
+        nextProgramDiscoveryMs = 0;
+        lastProgramDiagnosticHash = int.MinValue;
+        lastObservedRegistrationRevision = int.MinValue;
+        lastObservedPositionBudget = -1;
+        compactedRegistrationRevision = int.MinValue;
+        compactedRegistrations.Clear();
+        lastSelectionPlayerX = double.NaN;
+        lastSelectionPlayerY = double.NaN;
+        lastSelectionPlayerZ = double.NaN;
+        lastSelectionPlayerDimension = int.MinValue;
+        lastRenderReferenceX = double.NaN;
+        lastRenderReferenceY = double.NaN;
+        lastRenderReferenceZ = double.NaN;
+        lastRenderReferenceAvailable = false;
+        topologyRefreshInitialized = false;
+        positionLimitWarningLogged = 0;
+        compactionFailureWarningLogged = 0;
+        cellHashSnapshot = RoomWindCellHash.Build(
+            Array.Empty<RoomWindCellContribution>()
+        );
+        cellHashRevision++;
+        lastBuiltHashRegistrationRevision = int.MinValue;
+        lastBuiltHashDimension = int.MinValue;
+        pendingHashRegistrationRevision = int.MinValue;
+        pendingHashDimension = int.MinValue;
+        pendingHashSinceMs = 0;
+        stateRevision++;
+        renderReferenceRevision++;
+        renderReferenceQuarterX = 0;
+        renderReferenceQuarterY = 0;
+        renderReferenceQuarterZ = 0;
+        renderReferenceQuarterFractionX = 0f;
+        renderReferenceQuarterFractionY = 0f;
+        renderReferenceQuarterFractionZ = 0f;
+
+        DisposeCellHashTexture();
+
+        Volatile.Write(ref activeProgramCount, 0);
+        Volatile.Write(ref activeVegetationProgramCount, 0);
+        Volatile.Write(ref activeTerrainVegetationProgramCount, 0);
+        Volatile.Write(ref activeAuxiliaryVegetationProgramCount, 0);
+        Volatile.Write(ref activeLiquidProgramCount, 0);
+        Volatile.Write(ref requiredChunkOpaqueBound, 0);
+        Volatile.Write(ref uniformBridgeReady, 0);
+        Volatile.Write(ref uploadedRoomStateCount, 0);
+        Volatile.Write(ref compactedEnvelopeCount, 0);
+        Volatile.Write(ref uploadedCoveredPositionCount, 0);
+        Volatile.Write(ref lastUniformUploadFailure, "<none>");
     }
 
     public void OnRenderFrame(
@@ -723,6 +1934,8 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
         AdvanceRoomTypeStates(
             deltaTime
         );
+
+        UpdateRenderReference();
 
         long elapsedMs =
             api.ElapsedMilliseconds;
@@ -751,25 +1964,50 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
 
             nextProgramDiscoveryMs =
                 elapsedMs
-                + ProgramRediscoveryMs;
+                + ProgramRecoveryRediscoveryMs;
         }
         else if (
             elapsedMs
                 >= nextProgramDiscoveryMs
         )
         {
-            // Periodic rediscovery automatically rebinds after later graphics-
-            // setting shader reloads and records any program-id/interface change.
             nextProgramDiscoveryMs =
                 elapsedMs
-                + ProgramRediscoveryMs;
+                + ProgramRecoveryRediscoveryMs;
 
-            DiscoverPrograms(
-                "PeriodicRenderVerification"
-            );
+            if (NeedsProgramRediscovery())
+            {
+                DiscoverPrograms(
+                    "RecoveryVerification"
+                );
+            }
         }
 
         UploadRoomWindState();
+    }
+
+    private bool NeedsProgramRediscovery()
+    {
+        if (
+            programBindings.Count == 0
+            || !UniformBridgeReady
+        )
+        {
+            return true;
+        }
+
+        foreach (
+            ShaderProgramBinding binding
+            in programBindings
+        )
+        {
+            if (binding.Program.Disposed)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private void AdvanceRoomTypeStates(
@@ -786,22 +2024,21 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
             scaledDt = 0f;
         }
 
-        float glitchStrength =
-            api.Render.ShaderUniforms
-                .GlitchStrength;
+        bool stateChanged = false;
 
         foreach (
             RoomWindRuntimeState state
             in roomTypeStates
         )
         {
-            state.Advance(
-                scaledDt,
-                glitchStrength
-            );
+            stateChanged |= state.Advance(scaledDt);
         }
 
-        PublishStateMetrics();
+        if (stateChanged)
+        {
+            stateRevision++;
+            PublishStateMetrics();
+        }
     }
 
     private void PublishStateMetrics()
@@ -835,18 +2072,508 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
                     )
             ].CurrentPercent
         );
+
+        Volatile.Write(
+            ref greenhouseWaterCurrentPercent,
+            roomTypeStates[
+                StillGreenhousesRoomWindEnvironment
+                    .GetStateIndex(
+                        ManagedRoomType.Greenhouse,
+                        RoomWindTargetKind.Water
+                    )
+            ].CurrentPercent
+        );
+
+        Volatile.Write(
+            ref cellarWaterCurrentPercent,
+            roomTypeStates[
+                StillGreenhousesRoomWindEnvironment
+                    .GetStateIndex(
+                        ManagedRoomType.Cellar,
+                        RoomWindTargetKind.Water
+                    )
+            ].CurrentPercent
+        );
+
+        Volatile.Write(
+            ref roomWaterCurrentPercent,
+            roomTypeStates[
+                StillGreenhousesRoomWindEnvironment
+                    .GetStateIndex(
+                        ManagedRoomType.Room,
+                        RoomWindTargetKind.Water
+                    )
+            ].CurrentPercent
+        );
     }
 
     private void RefreshTopologySnapshot()
     {
+        RefreshCellHashSnapshot();
+    }
+
+    private void RefreshCellHashSnapshot()
+    {
+        long startTimestamp = Stopwatch.GetTimestamp();
+        int registrationRevisionAtStart = RegistrationRevision;
+        int dimension = api.World.Player?.Entity?.Pos.Dimension
+            ?? int.MinValue;
+
+        if (
+            registrationRevisionAtStart == lastBuiltHashRegistrationRevision
+            && dimension == lastBuiltHashDimension
+        )
+        {
+            Interlocked.Increment(ref topologyRefreshSkips);
+            return;
+        }
+
+        long elapsedMs = api.ElapsedMilliseconds;
+
+        if (
+            registrationRevisionAtStart != pendingHashRegistrationRevision
+            || dimension != pendingHashDimension
+        )
+        {
+            if (
+                dimension != lastBuiltHashDimension
+                && lastBuiltHashDimension != int.MinValue
+            )
+            {
+                RoomWindCellHashSnapshot emptySnapshot =
+                    RoomWindCellHash.Build(
+                        Array.Empty<RoomWindCellContribution>()
+                    );
+                cellHashSnapshot = emptySnapshot;
+                cellHashRevision++;
+                Volatile.Write(ref uploadedPositionCount, 0);
+
+                try
+                {
+                    UploadCellHashTexture(emptySnapshot);
+                }
+                catch
+                {
+                    // The next stable build retries the texture upload. The
+                    // published zero entry count already prevents stale cells
+                    // from matching in the new dimension.
+                }
+            }
+
+            pendingHashRegistrationRevision = registrationRevisionAtStart;
+            pendingHashDimension = dimension;
+            pendingHashSinceMs = elapsedMs;
+            Interlocked.Increment(ref topologyRefreshSkips);
+            return;
+        }
+
+        if (
+            elapsedMs - pendingHashSinceMs
+                < CellHashRegistrationDebounceMs
+        )
+        {
+            Interlocked.Increment(ref topologyRefreshSkips);
+            return;
+        }
+
+        List<RoomWindCellContribution> contributions = new();
+        int registrationCount = 0;
+        int greenhouseCount = 0;
+        int cellarCount = 0;
+        int roomCount = 0;
+        bool applyToWater = StillGreenhousesClientSystem.Config
+            ?.ApplyToWater == true;
+
+        foreach (
+            KeyValuePair<
+                ManagedVegetationShaderPosition,
+                ManagedRoomWindRegistration
+            > pair in RegisteredPositions
+        )
+        {
+            ManagedVegetationShaderPosition position = pair.Key;
+
+            if (position.Dimension != dimension)
+            {
+                continue;
+            }
+
+            ManagedRoomWindRegistration registration = pair.Value;
+            int stateIndex = StillGreenhousesRoomWindEnvironment
+                .GetStateIndex(registration.RoomType);
+            bool included = false;
+
+            if (
+                (registration.Targets & RoomWindTargetKind.Vegetation) != 0
+            )
+            {
+                AddEnvelopeCellContributions(
+                    contributions,
+                    position,
+                    registration.VegetationEnvelope,
+                    stateIndex,
+                    RoomWindTargetKind.Vegetation,
+                    EnvelopeMeasurementPadding
+                );
+
+                included = true;
+            }
+
+            if (
+                applyToWater
+                && (registration.Targets & RoomWindTargetKind.Water) != 0
+            )
+            {
+                // Water uses its exact registered block envelope. Vegetation's
+                // measurement padding must never bleed water motion into an
+                // adjacent liquid block.
+                AddEnvelopeCellContributions(
+                    contributions,
+                    position,
+                    registration.WaterEnvelope,
+                    stateIndex,
+                    RoomWindTargetKind.Water,
+                    padding: 0d
+                );
+
+                included = true;
+            }
+
+            if (!included)
+            {
+                continue;
+            }
+
+            registrationCount++;
+
+            switch (registration.RoomType)
+            {
+                case ManagedRoomType.Greenhouse:
+                    greenhouseCount++;
+                    break;
+                case ManagedRoomType.Cellar:
+                    cellarCount++;
+                    break;
+                default:
+                    roomCount++;
+                    break;
+            }
+        }
+
+        // Registrations may be produced by chunk tessellation threads while the
+        // render thread is taking this snapshot. Publish only a stable revision;
+        // otherwise wait for the next debounce window and try again.
+        if (registrationRevisionAtStart != RegistrationRevision)
+        {
+            pendingHashRegistrationRevision = RegistrationRevision;
+            pendingHashSinceMs = elapsedMs;
+            Interlocked.Increment(ref topologyRefreshSkips);
+            return;
+        }
+
+        try
+        {
+            RoomWindCellHashSnapshot nextSnapshot =
+                RoomWindCellHash.Build(contributions);
+
+            UploadCellHashTexture(nextSnapshot);
+            cellHashSnapshot = nextSnapshot;
+            cellHashRevision++;
+            lastBuiltHashRegistrationRevision = registrationRevisionAtStart;
+            lastBuiltHashDimension = dimension;
+            pendingHashRegistrationRevision = registrationRevisionAtStart;
+            pendingHashDimension = dimension;
+
+            Volatile.Write(ref uploadedPositionCount, nextSnapshot.EntryCount);
+            Volatile.Write(ref validPositionCount, registrationCount);
+            Volatile.Write(ref compactedEnvelopeCount, registrationCount);
+            Volatile.Write(
+                ref uploadedCoveredPositionCount,
+                nextSnapshot.EntryCount
+            );
+            PublishUploadedPositionTypeCounts(
+                greenhouseCount,
+                cellarCount,
+                roomCount
+            );
+            Interlocked.Increment(ref snapshotRevision);
+
+            if (StillGreenhousesClientSystem.Config?.DebugLogging == true)
+            {
+                StillGreenhousesClientSystem.DebugLiteral(
+                    "[StillGreenhouses] ROOM WIND CELL HASH "
+                    + $"registrationRevision={registrationRevisionAtStart}; "
+                    + $"dimension={dimension}; "
+                    + $"registrations={registrationCount}; "
+                    + $"contributions={contributions.Count}; "
+                    + $"cells={nextSnapshot.EntryCount}; "
+                    + $"capacity={nextSnapshot.Capacity}; "
+                    + $"texture={nextSnapshot.Width}x{nextSnapshot.Height}; "
+                    + $"maxProbe={nextSnapshot.MaxProbeCountUsed}/{RoomWindCellHash.ProbeLimit}; "
+                    + $"vegetationConflicts={nextSnapshot.VegetationConflictCount}; "
+                    + $"waterConflicts={nextSnapshot.WaterConflictCount}"
+                );
+            }
+
+            RecordTopologyRefreshPerformance(
+                startTimestamp,
+                contributions.Count,
+                "cell-hash-registration-revision"
+            );
+        }
+        catch (Exception e)
+        {
+            StillGreenhousesClientSystem.WarningLiteral(
+                "[StillGreenhouses] ROOM WIND CELL HASH BUILD FAILED "
+                + $"registrationRevision={registrationRevisionAtStart}; "
+                + $"dimension={dimension}; "
+                + $"error={e.GetType().Name}:{e.Message}; "
+                + "fallback=previous-hash-or-vanilla"
+            );
+
+            pendingHashSinceMs = elapsedMs;
+        }
+    }
+
+    private static void AddEnvelopeCellContributions(
+        List<RoomWindCellContribution> contributions,
+        ManagedVegetationShaderPosition position,
+        ManagedRoomWindEnvelope envelope,
+        int stateIndex,
+        RoomWindTargetKind target,
+        double padding
+    )
+    {
+        int minX = RoomWindCellCoordinate.QuantizeWorldCoordinate(
+            position.X + envelope.MinX - padding
+        );
+        int minY = RoomWindCellCoordinate.QuantizeWorldCoordinate(
+            position.Y + envelope.MinY - padding
+        );
+        int minZ = RoomWindCellCoordinate.QuantizeWorldCoordinate(
+            position.Z + envelope.MinZ - padding
+        );
+        int maxX = RoomWindCellCoordinate.QuantizeWorldCoordinate(
+            position.X + envelope.MaxX + padding
+        );
+        int maxY = RoomWindCellCoordinate.QuantizeWorldCoordinate(
+            position.Y + envelope.MaxY + padding
+        );
+        int maxZ = RoomWindCellCoordinate.QuantizeWorldCoordinate(
+            position.Z + envelope.MaxZ + padding
+        );
+
+        long cellCount = (long)(maxX - minX + 1)
+            * (maxY - minY + 1)
+            * (maxZ - minZ + 1);
+
+        if (cellCount <= 0 || cellCount > 1_000_000)
+        {
+            throw new InvalidOperationException(
+                $"Invalid room-wind envelope cell count {cellCount}."
+            );
+        }
+
+        for (int x = minX; x <= maxX; x++)
+        {
+            for (int y = minY; y <= maxY; y++)
+            {
+                for (int z = minZ; z <= maxZ; z++)
+                {
+                    RoomWindCellCoordinate coordinate = new(x, y, z);
+                    contributions.Add(
+                        target == RoomWindTargetKind.Water
+                            ? RoomWindCellContribution.ForWater(
+                                coordinate,
+                                stateIndex
+                            )
+                            : RoomWindCellContribution.ForVegetation(
+                                coordinate,
+                                stateIndex
+                            )
+                    );
+                }
+            }
+        }
+    }
+
+    private void UploadCellHashTexture(
+        RoomWindCellHashSnapshot snapshot
+    )
+    {
+        if (
+            cellHashTexture != null
+            && (
+                cellHashTexture.Width != snapshot.Width
+                || cellHashTexture.Height != snapshot.Height
+            )
+        )
+        {
+            DisposeCellHashTexture();
+        }
+
+        LoadedTexture texture = cellHashTexture
+            ?? new LoadedTexture(api);
+        texture.Width = snapshot.Width;
+        texture.Height = snapshot.Height;
+
+        api.Render.LoadOrUpdateTextureFromBgra(
+            snapshot.Pixels,
+            linearMag: false,
+            clampMode: 0,
+            ref texture
+        );
+
+        cellHashTexture = texture;
+    }
+
+    private void DisposeCellHashTexture()
+    {
+        if (cellHashTexture == null)
+        {
+            return;
+        }
+
+        try
+        {
+            cellHashTexture.Dispose();
+        }
+        catch
+        {
+            // Render shutdown may already have released the OpenGL context.
+        }
+
+        cellHashTexture = null;
+    }
+
+    private void UpdateRenderReference()
+    {
+        Vec3d? reference = api.Render.ShaderUniforms.playerReferencePos;
+        double x = reference?.X ?? 0d;
+        double y = reference?.Y ?? 0d;
+        double z = reference?.Z ?? 0d;
+
+        SplitReferenceQuarter(
+            x,
+            out int quarterX,
+            out float fractionX
+        );
+        SplitReferenceQuarter(
+            y,
+            out int quarterY,
+            out float fractionY
+        );
+        SplitReferenceQuarter(
+            z,
+            out int quarterZ,
+            out float fractionZ
+        );
+
+        if (
+            quarterX == renderReferenceQuarterX
+            && quarterY == renderReferenceQuarterY
+            && quarterZ == renderReferenceQuarterZ
+            && fractionX == renderReferenceQuarterFractionX
+            && fractionY == renderReferenceQuarterFractionY
+            && fractionZ == renderReferenceQuarterFractionZ
+        )
+        {
+            return;
+        }
+
+        renderReferenceQuarterX = quarterX;
+        renderReferenceQuarterY = quarterY;
+        renderReferenceQuarterZ = quarterZ;
+        renderReferenceQuarterFractionX = fractionX;
+        renderReferenceQuarterFractionY = fractionY;
+        renderReferenceQuarterFractionZ = fractionZ;
+        renderReferenceRevision++;
+    }
+
+    private static void SplitReferenceQuarter(
+        double coordinate,
+        out int wholeQuarterCells,
+        out float fractionalQuarterCell
+    )
+    {
+        double scaled = coordinate
+            * RoomWindCellCoordinate.CellsPerBlock;
+        double whole = Math.Floor(scaled);
+
+        if (whole < int.MinValue || whole > int.MaxValue)
+        {
+            throw new InvalidOperationException(
+                "The render reference exceeds the room-wind hash range."
+            );
+        }
+
+        wholeQuarterCells = (int)whole;
+        fractionalQuarterCell = (float)(scaled - whole);
+    }
+
+    // Retained for the 0.18.0 rollback window. The spatial-hash path above no
+    // longer invokes distance selection or the legacy 128/512 uniform budget.
+    private void RefreshLegacyTopologySnapshot()
+    {
+        long startTimestamp =
+            Stopwatch.GetTimestamp();
+
+        int currentRegistrationRevision =
+            RegistrationRevision;
+
+        int positionBudget =
+            ConfiguredPositionBudget;
+
         IClientPlayer? player =
             api.World.Player;
 
         if (player?.Entity == null)
         {
+            bool refreshRequired =
+                !topologyRefreshInitialized
+                || currentRegistrationRevision
+                    != lastObservedRegistrationRevision
+                || positionBudget
+                    != lastObservedPositionBudget
+                || topology.PositionCount > 0;
+
+            if (!refreshRequired)
+            {
+                Interlocked.Increment(
+                    ref topologyRefreshSkips
+                );
+
+                return;
+            }
+
             SetTopologySnapshot(
                 Array.Empty<PositionCandidate>(),
-                totalValid: 0
+                totalCompactedEnvelopes: 0,
+                totalValidPositions: 0,
+                referenceX: 0d,
+                referenceY: 0d,
+                referenceZ: 0d,
+                shaderPlayerX: 0f,
+                shaderPlayerY: 0f,
+                shaderPlayerZ: 0f,
+                referenceAvailable: false
+            );
+
+            topologyRefreshInitialized = true;
+            lastObservedRegistrationRevision =
+                currentRegistrationRevision;
+            lastObservedPositionBudget =
+                positionBudget;
+            lastRenderReferenceAvailable = false;
+            lastSelectionPlayerX = double.NaN;
+            lastSelectionPlayerY = double.NaN;
+            lastSelectionPlayerZ = double.NaN;
+            lastSelectionPlayerDimension = int.MinValue;
+
+            RecordTopologyRefreshPerformance(
+                startTimestamp,
+                candidatesEvaluated: 0,
+                reason: "no-player"
             );
 
             return;
@@ -861,22 +2588,134 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
         double playerZ =
             player.Entity.Pos.Z;
 
+        DefaultShaderUniforms shaderUniforms =
+            api.Render.ShaderUniforms;
+
+        Vec3d? renderReference =
+            shaderUniforms.playerReferencePos;
+
+        Vec3f? shaderPlayerPos =
+            shaderUniforms.PlayerPos;
+
+        double referenceX =
+            renderReference?.X ?? 0d;
+
+        double referenceY =
+            renderReference?.Y ?? 0d;
+
+        double referenceZ =
+            renderReference?.Z ?? 0d;
+
+        float shaderPlayerX =
+            shaderPlayerPos?.X ?? 0f;
+
+        float shaderPlayerY =
+            shaderPlayerPos?.Y ?? 0f;
+
+        float shaderPlayerZ =
+            shaderPlayerPos?.Z ?? 0f;
+
+        bool referenceAvailable =
+            renderReference != null;
+
+        bool wasInitialized =
+            topologyRefreshInitialized;
+
+        bool registrationChanged =
+            currentRegistrationRevision
+                != lastObservedRegistrationRevision;
+
+        bool budgetChanged =
+            positionBudget
+                != lastObservedPositionBudget;
+
+        bool referenceChanged =
+            !topologyRefreshInitialized
+            || referenceAvailable
+                != lastRenderReferenceAvailable
+            || (
+                referenceAvailable
+                && (
+                    referenceX != lastRenderReferenceX
+                    || referenceY != lastRenderReferenceY
+                    || referenceZ != lastRenderReferenceZ
+                )
+            );
+
         int playerDimension =
             player.Entity.Pos.Dimension;
 
-        List<PositionCandidate> candidates = new();
-        int totalValid = 0;
+        bool dimensionChanged =
+            playerDimension
+                != lastSelectionPlayerDimension;
+
+        bool selectionDependsOnPlayer =
+            topology.TotalCompactedEnvelopes
+                > positionBudget;
+
+        double selectionMovementSquared =
+            double.IsNaN(lastSelectionPlayerX)
+                ? double.MaxValue
+                : (
+                    playerX - lastSelectionPlayerX
+                ) * (
+                    playerX - lastSelectionPlayerX
+                )
+                + (
+                    playerY - lastSelectionPlayerY
+                ) * (
+                    playerY - lastSelectionPlayerY
+                )
+                + (
+                    playerZ - lastSelectionPlayerZ
+                ) * (
+                    playerZ - lastSelectionPlayerZ
+                );
+
+        bool playerMovedEnough =
+            selectionDependsOnPlayer
+            && selectionMovementSquared
+                >= TopologyMovementThresholdSquared;
+
+        if (
+            topologyRefreshInitialized
+            && !registrationChanged
+            && !budgetChanged
+            && !referenceChanged
+            && !dimensionChanged
+            && !playerMovedEnough
+        )
+        {
+            Interlocked.Increment(
+                ref topologyRefreshSkips
+            );
+
+            return;
+        }
+
+        IReadOnlyList<CompactedPositionEnvelope>
+            compacted = GetCompactedRegistrations(
+                out int representedRegistrationRevision
+            );
+
+        List<PositionCandidate> candidates = new(
+            Math.Min(
+                compacted.Count,
+                positionBudget * 4
+            )
+        );
+
+        int totalValidPositions = 0;
+        int totalCompactedEnvelopes = 0;
+        int candidatesEvaluated = 0;
 
         foreach (
-            KeyValuePair<
-                ManagedVegetationShaderPosition,
-                ManagedRoomWindRegistration
-            > entry
-            in RegisteredPositions
+            CompactedPositionEnvelope entry
+            in compacted
         )
         {
             ManagedVegetationShaderPosition registered =
-                entry.Key;
+                entry.Position;
 
             if (
                 registered.Dimension
@@ -886,141 +2725,1248 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
                 continue;
             }
 
-            BlockPos blockPos =
-                registered.ToBlockPos();
+            RoomWindTargetKind targets =
+                entry.Targets;
 
-            if (!StillGreenhousesClientSystem.TryGetCachedGreenhouse(
-                    blockPos,
-                    requestIfUnknown: false,
-                    out GreenhouseRegion? room
-                ))
-            {
-                if (StillGreenhousesClientSystem
-                        .HasCompleteCachedSnapshot(blockPos))
-                {
-                    RemoveRegisteredPosition(
-                        registered
-                    );
-                }
-
-                continue;
-            }
-
-            Block block =
-                api.World.BlockAccessor.GetBlock(
-                    blockPos
-                );
-
-            StillGreenhousesConfig? config =
-                StillGreenhousesClientSystem.Config;
-
-            RoomWindTargetKind validTargets =
-                RoomWindTargetKind.None;
-
-            if (
-                (
-                    entry.Value.Targets
-                    & RoomWindTargetKind.Vegetation
-                ) != 0
-                && StillGreenhousesShared.IsVegetationCandidate(
-                    block,
-                    config
-                )
-            )
-            {
-                validTargets |=
-                    RoomWindTargetKind.Vegetation;
-            }
-
-            if (
-                (
-                    entry.Value.Targets
-                    & RoomWindTargetKind.Water
-                ) != 0
-                && config?.ApplyToWater == true
-                && StillGreenhousesShared.IsWaterSurfaceSourceBlock(
-                    api.World.BlockAccessor,
-                    blockPos
-                )
-            )
-            {
-                validTargets |=
-                    RoomWindTargetKind.Water;
-            }
-
-            if (validTargets == RoomWindTargetKind.None)
-            {
-                RemoveRegisteredPosition(
-                    registered
-                );
-
-                continue;
-            }
-
-            if (!RegisteredPositions.TryUpdate(
-                    registered,
-                    new ManagedRoomWindRegistration(
-                        room.RoomType,
-                        validTargets
-                    ),
-                    entry.Value
-                ))
+            if (targets == RoomWindTargetKind.None)
             {
                 continue;
             }
 
-            totalValid++;
+            totalValidPositions +=
+                entry.CoveredPositionCount;
 
-            double dx =
-                registered.X
-                + 0.5d
-                - playerX;
-
-            double dy =
-                registered.Y
-                + 0.5d
-                - playerY;
-
-            double dz =
-                registered.Z
-                + 0.5d
-                - playerZ;
+            totalCompactedEnvelopes++;
+            candidatesEvaluated++;
 
             candidates.Add(
                 new PositionCandidate(
                     registered,
-                    room.RoomType,
-                    validTargets,
-                    dx * dx
-                    + dy * dy
-                    + dz * dz
+                    entry.RoomType,
+                    targets,
+                    entry.Envelope,
+                    entry.CoveredPositionCount,
+                    CalculateEncodedEnvelopeDistanceSquared(
+                        registered,
+                        entry.Envelope,
+                        playerX,
+                        playerY,
+                        playerZ
+                    )
                 )
             );
         }
 
-        candidates.Sort(
-            (left, right) =>
-                left.DistanceSquared.CompareTo(
-                    right.DistanceSquared
-                )
-        );
-
         SetTopologySnapshot(
             candidates,
-            totalValid
+            totalCompactedEnvelopes,
+            totalValidPositions,
+            referenceX,
+            referenceY,
+            referenceZ,
+            shaderPlayerX,
+            shaderPlayerY,
+            shaderPlayerZ,
+            referenceAvailable
         );
+
+        topologyRefreshInitialized = true;
+        lastObservedRegistrationRevision =
+            representedRegistrationRevision;
+        lastObservedPositionBudget =
+            positionBudget;
+        lastSelectionPlayerX =
+            playerX;
+        lastSelectionPlayerY =
+            playerY;
+        lastSelectionPlayerZ =
+            playerZ;
+        lastSelectionPlayerDimension =
+            playerDimension;
+        lastRenderReferenceAvailable =
+            referenceAvailable;
+        lastRenderReferenceX =
+            referenceX;
+        lastRenderReferenceY =
+            referenceY;
+        lastRenderReferenceZ =
+            referenceZ;
+
+        string reason =
+            !wasInitialized
+                ? "initial"
+                : registrationChanged
+                    ? "registration-revision"
+                    : budgetChanged
+                        ? "position-budget"
+                        : referenceChanged
+                            ? "render-reference"
+                            : dimensionChanged
+                                ? "player-dimension"
+                                : playerMovedEnough
+                                    ? "nearest-selection-movement"
+                                    : "forced";
+
+        RecordTopologyRefreshPerformance(
+            startTimestamp,
+            candidatesEvaluated,
+            reason
+        );
+    }
+
+    private IReadOnlyList<CompactedPositionEnvelope>
+        GetCompactedRegistrations(
+            out int representedRegistrationRevision
+        )
+    {
+        KeyValuePair<
+            ManagedVegetationShaderPosition,
+            ManagedRoomWindRegistration
+        >[] snapshot;
+
+        lock (RegistrationSync)
+        {
+            representedRegistrationRevision =
+                RegistrationRevision;
+
+            if (
+                compactedRegistrationRevision
+                    == representedRegistrationRevision
+            )
+            {
+                return compactedRegistrations;
+            }
+
+            snapshot = RegisteredPositions.ToArray();
+        }
+
+        List<CompactedPositionEnvelope> compacted;
+
+        try
+        {
+            compacted = BuildCompactedRegistrations(
+                snapshot
+            );
+        }
+        catch (Exception e)
+        {
+            // Compaction is an optimization. If an unexpected registration
+            // shape defeats an invariant, preserve correctness by reverting
+            // this revision to the original one-envelope-per-position form.
+            compacted = BuildSingletonRegistrations(
+                snapshot
+            );
+
+            if (
+                Interlocked.Exchange(
+                    ref compactionFailureWarningLogged,
+                    1
+                ) == 0
+            )
+            {
+                StillGreenhousesClientSystem.WarningLiteral(
+                    "[StillGreenhouses] ROOM WIND COMPACTION FALLBACK " +
+                    $"error={e.GetType().Name}:{e.Message}. " +
+                    "Raw position envelopes will be used for this world."
+                );
+            }
+        }
+
+        compactedRegistrations = compacted;
+        compactedRegistrationRevision =
+            representedRegistrationRevision;
+
+        return compactedRegistrations;
+    }
+
+    internal static List<CompactedPositionEnvelope>
+        BuildCompactedRegistrations(
+            IEnumerable<KeyValuePair<
+                ManagedVegetationShaderPosition,
+                ManagedRoomWindRegistration
+            >> registrations
+        )
+    {
+        List<KeyValuePair<
+            ManagedVegetationShaderPosition,
+            ManagedRoomWindRegistration
+        >> source = registrations
+            .Where(entry =>
+                entry.Value.Targets
+                    != RoomWindTargetKind.None
+            )
+            .ToList();
+
+        List<CompactedPositionEnvelope> result = new(
+            source.Count
+        );
+
+        Dictionary<
+            CompactionRunKey,
+            List<ManagedVegetationShaderPosition>
+        > runGroups = new();
+
+        foreach (
+            KeyValuePair<
+                ManagedVegetationShaderPosition,
+                ManagedRoomWindRegistration
+            > entry
+            in source
+        )
+        {
+            ManagedRoomWindEnvelope envelope =
+                entry.Value.GetEnvelope(
+                    entry.Value.Targets
+                );
+
+            if (!CanJoinXRun(
+                    entry.Key,
+                    entry.Value,
+                    envelope
+                ))
+            {
+                result.Add(
+                    CreateSingletonEnvelope(
+                        entry.Key,
+                        entry.Value,
+                        envelope
+                    )
+                );
+
+                continue;
+            }
+
+            CompactionRunKey runKey = new(
+                GetRegistrationChunk(entry.Key),
+                entry.Key.Y,
+                entry.Key.Z,
+                entry.Value.RoomKey,
+                entry.Value.RoomType,
+                entry.Value.Targets,
+                envelope
+            );
+
+            if (!runGroups.TryGetValue(
+                    runKey,
+                    out List<
+                        ManagedVegetationShaderPosition
+                    >? positions
+                ))
+            {
+                positions = new List<
+                    ManagedVegetationShaderPosition
+                >();
+
+                runGroups.Add(
+                    runKey,
+                    positions
+                );
+            }
+
+            positions.Add(entry.Key);
+        }
+
+        foreach (
+            KeyValuePair<
+                CompactionRunKey,
+                List<ManagedVegetationShaderPosition>
+            > group
+            in runGroups
+        )
+        {
+            List<ManagedVegetationShaderPosition> positions =
+                group.Value;
+
+            positions.Sort(
+                (left, right) =>
+                    left.X.CompareTo(right.X)
+            );
+
+            ManagedVegetationShaderPosition runAnchor =
+                positions[0];
+
+            ManagedVegetationShaderPosition previous =
+                runAnchor;
+
+            ManagedRoomWindEnvelope runEnvelope =
+                group.Key.Envelope;
+
+            int coveredPositionCount = 1;
+
+            for (int i = 1; i < positions.Count; i++)
+            {
+                ManagedVegetationShaderPosition next =
+                    positions[i];
+
+                long xDifference =
+                    (long)next.X - previous.X;
+
+                ManagedRoomWindEnvelope translated =
+                    group.Key.Envelope.Translate(
+                        next.X - runAnchor.X,
+                        0f,
+                        0f
+                    );
+
+                ManagedRoomWindEnvelope proposedEnvelope =
+                    runEnvelope.Union(translated);
+
+                bool canExtend =
+                    xDifference == 1L
+                    && EncodedXEnvelopesTouch(
+                        previous,
+                        group.Key.Envelope,
+                        next,
+                        group.Key.Envelope
+                    )
+                    && CanPackEnvelope(proposedEnvelope);
+
+                if (!canExtend)
+                {
+                    result.Add(
+                        CreateCompactedEnvelope(
+                            runAnchor,
+                            group.Key,
+                            runEnvelope,
+                            coveredPositionCount
+                        )
+                    );
+
+                    runAnchor = next;
+                    runEnvelope = group.Key.Envelope;
+                    coveredPositionCount = 1;
+                }
+                else
+                {
+                    runEnvelope = proposedEnvelope;
+                    coveredPositionCount++;
+                }
+
+                previous = next;
+            }
+
+            result.Add(
+                CreateCompactedEnvelope(
+                    runAnchor,
+                    group.Key,
+                    runEnvelope,
+                    coveredPositionCount
+                )
+            );
+        }
+
+        result = DecompactIncompatibleOverlaps(
+            result,
+            source
+        );
+
+        result.Sort(CompareCompactedEnvelopes);
+
+        int covered = result.Sum(
+            entry => entry.CoveredPositionCount
+        );
+
+        if (
+            covered != source.Count
+            || result.Any(entry =>
+                entry.CoveredPositionCount < 1
+                || (
+                    entry.CoveredPositionCount > 1
+                    && !CanPackEnvelope(entry.Envelope)
+                )
+            )
+        )
+        {
+            throw new InvalidOperationException(
+                "Spatial envelope compaction failed its coverage invariant."
+            );
+        }
+
+        return result;
+    }
+
+    private static List<CompactedPositionEnvelope>
+        DecompactIncompatibleOverlaps(
+            List<CompactedPositionEnvelope> compacted,
+            IReadOnlyList<KeyValuePair<
+                ManagedVegetationShaderPosition,
+                ManagedRoomWindRegistration
+            >> source
+        )
+    {
+        if (!compacted.Any(entry =>
+                entry.CoveredPositionCount > 1
+            ))
+        {
+            return compacted;
+        }
+
+        EncodedEnvelopeBounds[] bounds =
+            compacted
+                .Select(GetEncodedEnvelopeBounds)
+                .ToArray();
+
+        Dictionary<
+            EncodedEnvelopeBucketKey,
+            List<int>
+        > spatialBuckets = new();
+
+        List<int> unbucketed = new();
+
+        for (int index = 0; index < compacted.Count; index++)
+        {
+            if (!TryGetEnvelopeBucketRange(
+                    bounds[index],
+                    out EnvelopeBucketRange range
+                ))
+            {
+                unbucketed.Add(index);
+                continue;
+            }
+
+            for (int x = range.MinX; x <= range.MaxX; x++)
+            {
+                for (int y = range.MinY; y <= range.MaxY; y++)
+                {
+                    for (int z = range.MinZ; z <= range.MaxZ; z++)
+                    {
+                        EncodedEnvelopeBucketKey key = new(
+                            x,
+                            y,
+                            z,
+                            compacted[index]
+                                .Position.Dimension
+                        );
+
+                        if (!spatialBuckets.TryGetValue(
+                                key,
+                                out List<int>? indices
+                            ))
+                        {
+                            indices = new List<int>();
+                            spatialBuckets.Add(key, indices);
+                        }
+
+                        indices.Add(index);
+                    }
+                }
+            }
+        }
+
+        HashSet<int> runsToExpand = new();
+
+        int[] inspectedAtStamp =
+            new int[compacted.Count];
+
+        for (int i = 0; i < compacted.Count; i++)
+        {
+            CompactedPositionEnvelope candidate =
+                compacted[i];
+
+            if (candidate.CoveredPositionCount <= 1)
+            {
+                continue;
+            }
+
+            if (!TryGetEnvelopeBucketRange(
+                    bounds[i],
+                    out EnvelopeBucketRange candidateRange
+                ))
+            {
+                // Merged runs are always finite and packable, so reaching
+                // this path means an internal invariant was violated.
+                throw new InvalidOperationException(
+                    "A compacted run could not be assigned to a spatial bucket."
+                );
+            }
+
+            int inspectionStamp = i + 1;
+            bool conflictFound = false;
+
+            for (
+                int x = candidateRange.MinX;
+                x <= candidateRange.MaxX && !conflictFound;
+                x++
+            )
+            {
+                for (
+                    int y = candidateRange.MinY;
+                    y <= candidateRange.MaxY && !conflictFound;
+                    y++
+                )
+                {
+                    for (
+                        int z = candidateRange.MinZ;
+                        z <= candidateRange.MaxZ && !conflictFound;
+                        z++
+                    )
+                    {
+                        EncodedEnvelopeBucketKey key = new(
+                            x,
+                            y,
+                            z,
+                            candidate.Position.Dimension
+                        );
+
+                        if (!spatialBuckets.TryGetValue(
+                                key,
+                                out List<int>? indices
+                            ))
+                        {
+                            continue;
+                        }
+
+                        foreach (int j in indices)
+                        {
+                            if (
+                                inspectedAtStamp[j]
+                                    == inspectionStamp
+                            )
+                            {
+                                continue;
+                            }
+
+                            inspectedAtStamp[j] =
+                                inspectionStamp;
+
+                            if (HasIncompatibleOverlap(
+                                    i,
+                                    j,
+                                    compacted,
+                                    bounds
+                                ))
+                            {
+                                conflictFound = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!conflictFound)
+            {
+                foreach (int j in unbucketed)
+                {
+                    if (
+                        inspectedAtStamp[j]
+                            != inspectionStamp
+                        && HasIncompatibleOverlap(
+                            i,
+                            j,
+                            compacted,
+                            bounds
+                        )
+                    )
+                    {
+                        conflictFound = true;
+                        break;
+                    }
+                }
+            }
+
+            if (conflictFound)
+            {
+                runsToExpand.Add(i);
+            }
+        }
+
+        if (runsToExpand.Count == 0)
+        {
+            return compacted;
+        }
+
+        Dictionary<
+            ManagedVegetationShaderPosition,
+            ManagedRoomWindRegistration
+        > registrationsByPosition = new();
+
+        foreach (
+            KeyValuePair<
+                ManagedVegetationShaderPosition,
+                ManagedRoomWindRegistration
+            > entry
+            in source
+        )
+        {
+            registrationsByPosition[entry.Key] =
+                entry.Value;
+        }
+
+        List<CompactedPositionEnvelope> expanded = new(
+            compacted.Count
+            + runsToExpand.Sum(index =>
+                compacted[index].CoveredPositionCount - 1
+            )
+        );
+
+        for (int i = 0; i < compacted.Count; i++)
+        {
+            CompactedPositionEnvelope entry =
+                compacted[i];
+
+            if (!runsToExpand.Contains(i))
+            {
+                expanded.Add(entry);
+                continue;
+            }
+
+            for (
+                int offset = 0;
+                offset < entry.CoveredPositionCount;
+                offset++
+            )
+            {
+                ManagedVegetationShaderPosition position =
+                    new(
+                        entry.Position.X + offset,
+                        entry.Position.Y,
+                        entry.Position.Z,
+                        entry.Position.Dimension
+                    );
+
+                if (!registrationsByPosition.TryGetValue(
+                        position,
+                        out ManagedRoomWindRegistration registration
+                    ))
+                {
+                    throw new InvalidOperationException(
+                        "A compacted run could not be expanded to its source registrations."
+                    );
+                }
+
+                expanded.Add(
+                    CreateSingletonEnvelope(
+                        position,
+                        registration,
+                        registration.GetEnvelope(
+                            registration.Targets
+                        )
+                    )
+                );
+            }
+        }
+
+        return expanded;
+    }
+
+    private static bool HasIncompatibleOverlap(
+        int candidateIndex,
+        int otherIndex,
+        IReadOnlyList<CompactedPositionEnvelope> compacted,
+        IReadOnlyList<EncodedEnvelopeBounds> bounds
+    )
+    {
+        if (candidateIndex == otherIndex)
+        {
+            return false;
+        }
+
+        CompactedPositionEnvelope candidate =
+            compacted[candidateIndex];
+
+        CompactedPositionEnvelope other =
+            compacted[otherIndex];
+
+        // Preserve the original per-position overlap arbitration across room
+        // identities. Room state is currently shared by type, but treating a
+        // different exact room as incompatible keeps this optimization safe if
+        // room-local state is introduced later.
+        return candidate.Position.Dimension
+                   == other.Position.Dimension
+               && candidate.RoomKey
+                   != other.RoomKey
+               && (
+                   candidate.Targets
+                   & other.Targets
+               ) != RoomWindTargetKind.None
+               && bounds[candidateIndex].Overlaps(
+                   bounds[otherIndex]
+               );
+    }
+
+    private static bool TryGetEnvelopeBucketRange(
+        EncodedEnvelopeBounds bounds,
+        out EnvelopeBucketRange range
+    )
+    {
+        if (
+            !double.IsFinite(bounds.MinX)
+            || !double.IsFinite(bounds.MinY)
+            || !double.IsFinite(bounds.MinZ)
+            || !double.IsFinite(bounds.MaxX)
+            || !double.IsFinite(bounds.MaxY)
+            || !double.IsFinite(bounds.MaxZ)
+        )
+        {
+            range = default;
+            return false;
+        }
+
+        range = new EnvelopeBucketRange(
+            GetEnvelopeBucketCoordinate(bounds.MinX),
+            GetEnvelopeBucketCoordinate(bounds.MinY),
+            GetEnvelopeBucketCoordinate(bounds.MinZ),
+            GetEnvelopeBucketCoordinate(bounds.MaxX),
+            GetEnvelopeBucketCoordinate(bounds.MaxY),
+            GetEnvelopeBucketCoordinate(bounds.MaxZ)
+        );
+
+        return true;
+    }
+
+    private static int GetEnvelopeBucketCoordinate(
+        double coordinate
+    ) =>
+        (int)Math.Floor(
+            coordinate
+            / CompactionOverlapBucketSizeBlocks
+        );
+
+    private static EncodedEnvelopeBounds
+        GetEncodedEnvelopeBounds(
+            CompactedPositionEnvelope entry
+        )
+    {
+        double centerX =
+            entry.Position.X
+            + entry.Envelope.CenterX;
+
+        double centerY =
+            entry.Position.Y
+            + entry.Envelope.CenterY;
+
+        double centerZ =
+            entry.Position.Z
+            + entry.Envelope.CenterZ;
+
+        double halfExtentX =
+            QuantizeEnvelopeHalfExtent(
+                entry.Envelope.HalfExtentX
+            )
+            * EnvelopeExtentQuantization;
+
+        double halfExtentY =
+            QuantizeEnvelopeHalfExtent(
+                entry.Envelope.HalfExtentY
+            )
+            * EnvelopeExtentQuantization;
+
+        double halfExtentZ =
+            QuantizeEnvelopeHalfExtent(
+                entry.Envelope.HalfExtentZ
+            )
+            * EnvelopeExtentQuantization;
+
+        return new EncodedEnvelopeBounds(
+            centerX - halfExtentX,
+            centerY - halfExtentY,
+            centerZ - halfExtentZ,
+            centerX + halfExtentX,
+            centerY + halfExtentY,
+            centerZ + halfExtentZ
+        );
+    }
+
+    internal static List<CompactedPositionEnvelope>
+        BuildSingletonRegistrations(
+            IEnumerable<KeyValuePair<
+                ManagedVegetationShaderPosition,
+                ManagedRoomWindRegistration
+            >> registrations
+        )
+    {
+        List<CompactedPositionEnvelope> result =
+            registrations
+                .Where(entry =>
+                    entry.Value.Targets
+                        != RoomWindTargetKind.None
+                )
+                .Select(entry =>
+                    CreateSingletonEnvelope(
+                        entry.Key,
+                        entry.Value,
+                        entry.Value.GetEnvelope(
+                            entry.Value.Targets
+                        )
+                    )
+                )
+                .ToList();
+
+        result.Sort(CompareCompactedEnvelopes);
+
+        return result;
+    }
+
+    private static CompactedPositionEnvelope
+        CreateSingletonEnvelope(
+            ManagedVegetationShaderPosition position,
+            ManagedRoomWindRegistration registration,
+            ManagedRoomWindEnvelope envelope
+        ) =>
+            new(
+                position,
+                registration.RoomKey,
+                registration.RoomType,
+                registration.Targets,
+                envelope,
+                1
+            );
+
+    private static CompactedPositionEnvelope
+        CreateCompactedEnvelope(
+            ManagedVegetationShaderPosition position,
+            CompactionRunKey runKey,
+            ManagedRoomWindEnvelope envelope,
+            int coveredPositionCount
+        ) =>
+            new(
+                position,
+                runKey.RoomKey,
+                runKey.RoomType,
+                runKey.Targets,
+                envelope,
+                coveredPositionCount
+            );
+
+    private static ChunkKey GetRegistrationChunk(
+        ManagedVegetationShaderPosition position
+    ) =>
+        new(
+            StillGreenhousesShared.FloorDiv(
+                position.X,
+                StillGreenhousesShared.ChunkSize
+            ),
+            StillGreenhousesShared.FloorDiv(
+                position.Y,
+                StillGreenhousesShared.ChunkSize
+            ),
+            StillGreenhousesShared.FloorDiv(
+                position.Z,
+                StillGreenhousesShared.ChunkSize
+            ),
+            position.Dimension
+        );
+
+    private static bool CanJoinXRun(
+        ManagedVegetationShaderPosition position,
+        ManagedRoomWindRegistration registration,
+        ManagedRoomWindEnvelope envelope
+    ) =>
+        registration.AllowXRunCompaction
+        && !registration.AllowRoomAbove
+        && (
+            registration.Targets
+                is RoomWindTargetKind.Vegetation
+                or RoomWindTargetKind.Water
+        )
+        && registration.RoomKey.Dimension
+            == position.Dimension
+        && registration.RoomKey.RoomType
+            == registration.RoomType
+        && IsFiniteOrderedEnvelope(envelope)
+        && IsContainedInUnitBlock(envelope)
+        && CanPackEnvelope(envelope);
+
+    private static bool IsFiniteOrderedEnvelope(
+        ManagedRoomWindEnvelope envelope
+    ) =>
+        float.IsFinite(envelope.MinX)
+        && float.IsFinite(envelope.MinY)
+        && float.IsFinite(envelope.MinZ)
+        && float.IsFinite(envelope.MaxX)
+        && float.IsFinite(envelope.MaxY)
+        && float.IsFinite(envelope.MaxZ)
+        && envelope.MinX <= envelope.MaxX
+        && envelope.MinY <= envelope.MaxY
+        && envelope.MinZ <= envelope.MaxZ;
+
+    private static bool IsContainedInUnitBlock(
+        ManagedRoomWindEnvelope envelope
+    ) =>
+        envelope.MinX >= 0f
+        && envelope.MinY >= 0f
+        && envelope.MinZ >= 0f
+        && envelope.MaxX <= 1f
+        && envelope.MaxY <= 1f
+        && envelope.MaxZ <= 1f;
+
+    private static bool EncodedXEnvelopesTouch(
+        ManagedVegetationShaderPosition leftPosition,
+        ManagedRoomWindEnvelope leftEnvelope,
+        ManagedVegetationShaderPosition rightPosition,
+        ManagedRoomWindEnvelope rightEnvelope
+    )
+    {
+        double leftCenter =
+            leftPosition.X
+            + leftEnvelope.CenterX;
+
+        double leftHalfExtent =
+            QuantizeEnvelopeHalfExtent(
+                leftEnvelope.HalfExtentX
+            )
+            * EnvelopeExtentQuantization;
+
+        double rightCenter =
+            rightPosition.X
+            + rightEnvelope.CenterX;
+
+        double rightHalfExtent =
+            QuantizeEnvelopeHalfExtent(
+                rightEnvelope.HalfExtentX
+            )
+            * EnvelopeExtentQuantization;
+
+        return leftCenter + leftHalfExtent
+            >= rightCenter - rightHalfExtent;
+    }
+
+    private static int CompareCompactedEnvelopes(
+        CompactedPositionEnvelope left,
+        CompactedPositionEnvelope right
+    )
+    {
+        int comparison =
+            left.Position.Dimension.CompareTo(
+                right.Position.Dimension
+            );
+
+        if (comparison != 0) return comparison;
+
+        comparison = left.Position.X.CompareTo(
+            right.Position.X
+        );
+
+        if (comparison != 0) return comparison;
+
+        comparison = left.Position.Y.CompareTo(
+            right.Position.Y
+        );
+
+        return comparison != 0
+            ? comparison
+            : left.Position.Z.CompareTo(
+                right.Position.Z
+            );
+    }
+
+    private static void RecordTopologyRefreshPerformance(
+        long startTimestamp,
+        int candidatesEvaluated,
+        string reason
+    )
+    {
+        long elapsedMicroseconds =
+            GetElapsedMicroseconds(
+                startTimestamp
+            );
+
+        Interlocked.Increment(
+            ref topologyRefreshRuns
+        );
+
+        Interlocked.Add(
+            ref topologyCandidatesEvaluated,
+            candidatesEvaluated
+        );
+
+        Interlocked.Exchange(
+            ref lastTopologyRefreshMicroseconds,
+            elapsedMicroseconds
+        );
+
+        UpdateMaximum(
+            ref maxTopologyRefreshMicroseconds,
+            elapsedMicroseconds
+        );
+
+        if (
+            StillGreenhousesClientSystem.Config
+                ?.DebugLogging == true
+            && elapsedMicroseconds >= 2000
+        )
+        {
+            StillGreenhousesClientSystem.DebugLiteral(
+                "[StillGreenhouses] CLIENT PERF " +
+                "operation=render-topology-refresh; " +
+                $"elapsedMs={elapsedMicroseconds / 1000d:F3}; " +
+                $"reason={reason}; " +
+                $"registered={RegisteredPositions.Count}; " +
+                $"candidatesEvaluated={candidatesEvaluated}; " +
+                $"selected={UploadedPositionCount}/{ConfiguredPositionBudget}; " +
+                "thread=render"
+            );
+        }
+    }
+
+    private static long GetElapsedMicroseconds(
+        long startTimestamp
+    ) =>
+        (
+            Stopwatch.GetTimestamp()
+            - startTimestamp
+        )
+        * 1_000_000L
+        / Stopwatch.Frequency;
+
+    private static void UpdateMaximum(
+        ref long target,
+        long value
+    )
+    {
+        long observed =
+            Interlocked.Read(
+                ref target
+            );
+
+        while (
+            value > observed
+            && Interlocked.CompareExchange(
+                ref target,
+                value,
+                observed
+            ) != observed
+        )
+        {
+            observed =
+                Interlocked.Read(
+                    ref target
+                );
+        }
+    }
+
+    private static int QuantizeEnvelopeHalfExtent(
+        float halfExtent
+    )
+    {
+        float paddedExtent =
+            Math.Max(
+                0f,
+                halfExtent
+            )
+            + EnvelopeMeasurementPadding;
+
+        int quantized =
+            (int)Math.Ceiling(
+                paddedExtent
+                / EnvelopeExtentQuantization
+            );
+
+        return Math.Clamp(
+            quantized,
+            1,
+            EnvelopeExtentMask
+        );
+    }
+
+    internal static bool CanPackEnvelope(
+        ManagedRoomWindEnvelope envelope
+    ) =>
+        IsFiniteOrderedEnvelope(envelope)
+        && CanPackEnvelopeHalfExtent(
+            envelope.HalfExtentX
+        )
+        && CanPackEnvelopeHalfExtent(
+            envelope.HalfExtentY
+        )
+        && CanPackEnvelopeHalfExtent(
+            envelope.HalfExtentZ
+        );
+
+    private static bool CanPackEnvelopeHalfExtent(
+        float halfExtent
+    )
+    {
+        if (!float.IsFinite(halfExtent))
+        {
+            return false;
+        }
+
+        float paddedExtent =
+            Math.Max(
+                0f,
+                halfExtent
+            )
+            + EnvelopeMeasurementPadding;
+
+        int quantized =
+            (int)Math.Ceiling(
+                paddedExtent
+                / EnvelopeExtentQuantization
+            );
+
+        return quantized >= 1
+            && quantized <= EnvelopeExtentMask;
+    }
+
+    internal static double
+        CalculateEncodedEnvelopeDistanceSquared(
+            ManagedVegetationShaderPosition position,
+            ManagedRoomWindEnvelope envelope,
+            double pointX,
+            double pointY,
+            double pointZ
+        )
+    {
+        double centerX =
+            position.X + envelope.CenterX;
+
+        double centerY =
+            position.Y + envelope.CenterY;
+
+        double centerZ =
+            position.Z + envelope.CenterZ;
+
+        double halfExtentX =
+            QuantizeEnvelopeHalfExtent(
+                envelope.HalfExtentX
+            )
+            * EnvelopeExtentQuantization;
+
+        double halfExtentY =
+            QuantizeEnvelopeHalfExtent(
+                envelope.HalfExtentY
+            )
+            * EnvelopeExtentQuantization;
+
+        double halfExtentZ =
+            QuantizeEnvelopeHalfExtent(
+                envelope.HalfExtentZ
+            )
+            * EnvelopeExtentQuantization;
+
+        double dx = DistanceToInterval(
+            pointX,
+            centerX - halfExtentX,
+            centerX + halfExtentX
+        );
+
+        double dy = DistanceToInterval(
+            pointY,
+            centerY - halfExtentY,
+            centerY + halfExtentY
+        );
+
+        double dz = DistanceToInterval(
+            pointZ,
+            centerZ - halfExtentZ,
+            centerZ + halfExtentZ
+        );
+
+        return dx * dx
+            + dy * dy
+            + dz * dz;
+    }
+
+    private static double DistanceToInterval(
+        double value,
+        double minimum,
+        double maximum
+    ) =>
+        value < minimum
+            ? minimum - value
+            : value > maximum
+                ? value - maximum
+                : 0d;
+
+    private static int PackTargetAndEnvelope(
+        int packedTarget,
+        ManagedRoomWindEnvelope envelope
+    )
+    {
+        int extentX = QuantizeEnvelopeHalfExtent(
+            envelope.HalfExtentX
+        );
+
+        int extentY = QuantizeEnvelopeHalfExtent(
+            envelope.HalfExtentY
+        );
+
+        int extentZ = QuantizeEnvelopeHalfExtent(
+            envelope.HalfExtentZ
+        );
+
+        return
+            (packedTarget & PackedTargetMask)
+            | (
+                extentX
+                << PackedTargetBits
+            )
+            | (
+                extentY
+                << (
+                    PackedTargetBits
+                    + EnvelopeExtentBits
+                )
+            )
+            | (
+                extentZ
+                << (
+                    PackedTargetBits
+                    + EnvelopeExtentBits * 2
+                )
+            );
     }
 
     private void SetTopologySnapshot(
         IReadOnlyList<PositionCandidate> candidates,
-        int totalValid
+        int totalCompactedEnvelopes,
+        int totalValidPositions,
+        double referenceX,
+        double referenceY,
+        double referenceZ,
+        float shaderPlayerX,
+        float shaderPlayerY,
+        float shaderPlayerZ,
+        bool referenceAvailable
     )
     {
         List<PositionCandidate> selectedCandidates =
-            SelectBudgetedPositions(candidates);
+            referenceAvailable
+                ? SelectBudgetedPositions(candidates)
+                : new List<PositionCandidate>();
+
+        // Distance controls selection when the GPU budget is full, but it
+        // must not control uniform-array order. Canonical ordering prevents
+        // needless topology uploads when the same entries merely exchange
+        // nearest-distance order as the player moves.
+        selectedCandidates.Sort(
+            (left, right) =>
+            {
+                int comparison =
+                    left.Position.Dimension.CompareTo(
+                        right.Position.Dimension
+                    );
+
+                if (comparison != 0) return comparison;
+
+                comparison = left.Position.X.CompareTo(
+                    right.Position.X
+                );
+
+                if (comparison != 0) return comparison;
+
+                comparison = left.Position.Y.CompareTo(
+                    right.Position.Y
+                );
+
+                return comparison != 0
+                    ? comparison
+                    : left.Position.Z.CompareTo(
+                        right.Position.Z
+                    );
+            }
+        );
 
         int selectedCount =
             selectedCandidates.Count;
+
+        int selectedCoveredPositionCount =
+            selectedCandidates.Sum(
+                candidate =>
+                    candidate.CoveredPositionCount
+            );
 
         float[] positionValues =
             new float[
@@ -1067,14 +4013,35 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
             int offset =
                 i * 4;
 
+            float relativeX =
+                (float)(
+                    candidate.Position.X
+                    + candidate.Envelope.CenterX
+                    - referenceX
+                );
+
+            float relativeY =
+                (float)(
+                    candidate.Position.Y
+                    + candidate.Envelope.CenterY
+                    - referenceY
+                );
+
+            float relativeZ =
+                (float)(
+                    candidate.Position.Z
+                    + candidate.Envelope.CenterZ
+                    - referenceZ
+                );
+
             positionValues[offset] =
-                candidate.Position.X;
+                relativeX;
 
             positionValues[offset + 1] =
-                candidate.Position.Y;
+                relativeY;
 
             positionValues[offset + 2] =
-                candidate.Position.Z;
+                relativeZ;
 
             int packedTarget =
                 stateIndex
@@ -1084,29 +4051,46 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
                         .RoomTypeStateCount
                 );
 
+            int packedMetadata =
+                PackTargetAndEnvelope(
+                    packedTarget,
+                    candidate.Envelope
+                );
+
             positionValues[offset + 3] =
-                packedTarget;
+                packedMetadata;
 
             hash = AddHash(
                 hash,
-                candidate.Position.X
+                BitConverter.SingleToInt32Bits(
+                    relativeX
+                )
             );
 
             hash = AddHash(
                 hash,
-                candidate.Position.Y
+                BitConverter.SingleToInt32Bits(
+                    relativeY
+                )
             );
 
             hash = AddHash(
                 hash,
-                candidate.Position.Z
+                BitConverter.SingleToInt32Bits(
+                    relativeZ
+                )
             );
 
             hash = AddHash(
                 hash,
-                packedTarget
+                packedMetadata
             );
         }
+
+        hash = AddHash(
+            hash,
+            referenceAvailable ? 1 : 0
+        );
 
         hash = AddHash(
             hash,
@@ -1115,7 +4099,10 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
 
         if (
             hash == topology.ContentHash
-            && totalValid == topology.TotalValid
+            && totalCompactedEnvelopes
+                == topology.TotalCompactedEnvelopes
+            && totalValidPositions
+                == topology.TotalValidPositions
         )
         {
             PublishUploadedPositionTypeCounts(
@@ -1131,7 +4118,17 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
 
             Volatile.Write(
                 ref validPositionCount,
-                totalValid
+                totalValidPositions
+            );
+
+            Volatile.Write(
+                ref compactedEnvelopeCount,
+                totalCompactedEnvelopes
+            );
+
+            Volatile.Write(
+                ref uploadedCoveredPositionCount,
+                selectedCoveredPositionCount
             );
 
             return;
@@ -1146,34 +4143,137 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
             new RoomWindTopologySnapshot(
                 positionValues,
                 selectedCount,
-                totalValid,
+                totalCompactedEnvelopes,
+                totalValidPositions,
                 hash,
                 revision
             );
 
-        string positionPreview =
-            selectedCount == 0
-                ? "<none>"
-                : string.Join(
-                    "|",
-                    selectedCandidates
-                        .Take(16)
-                        .Select(candidate =>
-                            $"{candidate.Position.X},{candidate.Position.Y},{candidate.Position.Z}:" +
-                            $"{candidate.RoomType}/{candidate.Targets}/d2={candidate.DistanceSquared:0.##}"
-                        )
-                );
+        if (
+            StillGreenhousesClientSystem.Config
+                ?.DebugLogging == true
+        )
+        {
+            string positionPreview =
+                selectedCount == 0
+                    ? "<none>"
+                    : string.Join(
+                        "|",
+                        selectedCandidates
+                            .Take(16)
+                            .Select(candidate =>
+                            {
+                                float relativeX =
+                                    (float)(
+                                        candidate.Position.X
+                                        + candidate.Envelope.CenterX
+                                        - referenceX
+                                    );
 
-        StillGreenhousesClientSystem.DebugLiteral(
-            "[StillGreenhouses] ROOM WIND POSITION SNAPSHOT " +
-            $"revision={revision}; " +
-            $"registered={RegisteredPositions.Count}; " +
-            $"valid={totalValid}; " +
-            $"selected={selectedCount}/{MaxUploadedPositions}; " +
-            $"matchStrategy=VanillaPlayerReferenceAbsoluteBlockAabb; " +
-            $"debugVisualProof={StillGreenhousesClientSystem.Config?.DebugRoomWindVisualProof == true}; " +
-            $"positions={positionPreview}"
-        );
+                                float relativeY =
+                                    (float)(
+                                        candidate.Position.Y
+                                        + candidate.Envelope.CenterY
+                                        - referenceY
+                                    );
+
+                                float relativeZ =
+                                    (float)(
+                                        candidate.Position.Z
+                                        + candidate.Envelope.CenterZ
+                                        - referenceZ
+                                    );
+
+                                int extentX = QuantizeEnvelopeHalfExtent(
+                                    candidate.Envelope.HalfExtentX
+                                );
+
+                                int extentY = QuantizeEnvelopeHalfExtent(
+                                    candidate.Envelope.HalfExtentY
+                                );
+
+                                int extentZ = QuantizeEnvelopeHalfExtent(
+                                    candidate.Envelope.HalfExtentZ
+                                );
+
+                                return
+                                    $"{candidate.Position.X},{candidate.Position.Y},{candidate.Position.Z}" +
+                                    $"->renderCenter({relativeX:0.###},{relativeY:0.###},{relativeZ:0.###})" +
+                                    $"/halfQ({extentX},{extentY},{extentZ})" +
+                                    $"/covered={candidate.CoveredPositionCount}" +
+                                    $"/local=[{candidate.Envelope.MinX:0.###},{candidate.Envelope.MinY:0.###},{candidate.Envelope.MinZ:0.###}.." +
+                                    $"{candidate.Envelope.MaxX:0.###},{candidate.Envelope.MaxY:0.###},{candidate.Envelope.MaxZ:0.###}]:" +
+                                    $"{candidate.RoomType}/{candidate.Targets}/d2={candidate.DistanceSquared:0.##}";
+                            })
+                    );
+
+            string entityPosition =
+                api.World.Player?.Entity == null
+                    ? "<none>"
+                    : $"{api.World.Player.Entity.Pos.X:0.###}," +
+                      $"{api.World.Player.Entity.Pos.Y:0.###}," +
+                      $"{api.World.Player.Entity.Pos.Z:0.###}";
+
+            string renderReferenceDescription =
+                referenceAvailable
+                    ? $"{referenceX:0.###},{referenceY:0.###},{referenceZ:0.###}"
+                    : "<unavailable>";
+
+            StillGreenhousesClientSystem.DebugLiteral(
+                "[StillGreenhouses] ROOM WIND RENDER REFERENCE " +
+                $"revision={revision}; " +
+                $"entityPos={entityPosition}; " +
+                $"shaderPlayerPos={shaderPlayerX:0.###},{shaderPlayerY:0.###},{shaderPlayerZ:0.###}; " +
+                $"shaderPlayerReferencePos={renderReferenceDescription}; " +
+                $"referenceAvailable={referenceAvailable}"
+            );
+
+            StillGreenhousesClientSystem.DebugLiteral(
+                "[StillGreenhouses] ROOM WIND POSITION SNAPSHOT " +
+                $"revision={revision}; " +
+                $"registered={RegisteredPositions.Count}; " +
+                $"validPositions={totalValidPositions}; " +
+                $"compactedEnvelopes={totalCompactedEnvelopes}; " +
+                $"selected={selectedCount}/{ConfiguredPositionBudget}; " +
+                $"coveredPositions={selectedCoveredPositionCount}; " +
+                $"matchStrategy=PlayerReferenceRelativeWindVertexEnvelope; " +
+                "referenceSource=DefaultShaderUniforms.playerReferencePos; " +
+                $"reference={renderReferenceDescription}; " +
+                $"debugCallSiteProof={StillGreenhousesClientSystem.Config?.DebugRoomWindCallSiteProof == true}; " +
+                $"debugVisualProof={StillGreenhousesClientSystem.Config?.DebugRoomWindVisualProof == true}; " +
+                "proofTransform=WindVerticesYPlus0.35; " +
+                $"positions={positionPreview}"
+            );
+        }
+
+        if (
+            totalCompactedEnvelopes
+                > ConfiguredPositionBudget
+            && Interlocked.Exchange(
+                ref positionLimitWarningLogged,
+                1
+            ) == 0
+        )
+        {
+            StillGreenhousesClientSystem.WarningLiteral(
+                "[StillGreenhouses] ROOM WIND POSITION LIMIT REACHED " +
+                $"registered={totalValidPositions}; " +
+                $"compacted={totalCompactedEnvelopes}; " +
+                $"uploaded={selectedCount}/{ConfiguredPositionBudget}; " +
+                $"covered={selectedCoveredPositionCount}. " +
+                "Nearest compacted envelopes are prioritized; positions outside the GPU mask retain vanilla global wind."
+            );
+        }
+        else if (
+            totalCompactedEnvelopes
+                <= ConfiguredPositionBudget
+        )
+        {
+            Volatile.Write(
+                ref positionLimitWarningLogged,
+                0
+            );
+        }
 
         PublishUploadedPositionTypeCounts(
             greenhousePositionCount,
@@ -1188,7 +4288,17 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
 
         Volatile.Write(
             ref validPositionCount,
-            totalValid
+            totalValidPositions
+        );
+
+        Volatile.Write(
+            ref compactedEnvelopeCount,
+            totalCompactedEnvelopes
+        );
+
+        Volatile.Write(
+            ref uploadedCoveredPositionCount,
+            selectedCoveredPositionCount
         );
     }
 
@@ -1197,66 +4307,132 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
             IReadOnlyList<PositionCandidate> candidates
         )
     {
+        int positionBudget =
+            ConfiguredPositionBudget;
+
+        if (candidates.Count <= positionBudget)
+        {
+            return new List<PositionCandidate>(
+                candidates
+            );
+        }
+
+        ReservedPositionBudgets reservedBudgets =
+            CalculateReservedPositionBudgets(
+                positionBudget
+            );
+
         List<PositionCandidate> selected =
-            new(MaxUploadedPositions);
+            new(positionBudget);
 
         HashSet<ManagedVegetationShaderPosition>
             selectedPositions = new();
 
-        AddReservedPositions(
+        AddBestPositions(
             candidates,
-            ManagedRoomType.Greenhouse,
-            GreenhouseReservedPositionBudget,
+            reservedBudgets.Greenhouse,
             selected,
-            selectedPositions
+            selectedPositions,
+            roomType: ManagedRoomType.Greenhouse
         );
 
-        AddReservedPositions(
+        AddBestPositions(
             candidates,
-            ManagedRoomType.Cellar,
-            CellarReservedPositionBudget,
+            reservedBudgets.Cellar,
             selected,
-            selectedPositions
+            selectedPositions,
+            roomType: ManagedRoomType.Cellar
         );
 
-        AddReservedPositions(
+        AddBestPositions(
             candidates,
-            ManagedRoomType.Room,
-            RoomReservedPositionBudget,
+            reservedBudgets.Room,
             selected,
-            selectedPositions
+            selectedPositions,
+            roomType: ManagedRoomType.Room
         );
 
-        // Redistribute every unused reserved slot to the globally nearest
-        // remaining candidate, regardless of room type.
-        foreach (
-            PositionCandidate candidate
-            in candidates
-        )
-        {
-            if (selected.Count >= MaxUploadedPositions)
-            {
-                break;
-            }
-
-            if (selectedPositions.Add(candidate.Position))
-            {
-                selected.Add(candidate);
-            }
-        }
+        AddBestPositions(
+            candidates,
+            positionBudget - selected.Count,
+            selected,
+            selectedPositions,
+            roomType: null
+        );
 
         return selected;
     }
 
-    private static void AddReservedPositions(
+    private static ReservedPositionBudgets
+        CalculateReservedPositionBudgets(
+            int totalBudget
+        )
+    {
+        int greenhouse =
+            Math.Max(1, totalBudget / 2);
+
+        int cellar =
+            totalBudget >= 2
+                ? Math.Max(1, totalBudget / 4)
+                : 0;
+
+        int room =
+            totalBudget - greenhouse - cellar;
+
+        if (
+            totalBudget >= 3
+            && room < 1
+        )
+        {
+            room = 1;
+
+            if (greenhouse > 1)
+            {
+                greenhouse--;
+            }
+            else
+            {
+                cellar--;
+            }
+        }
+
+        return new ReservedPositionBudgets(
+            greenhouse,
+            cellar,
+            room
+        );
+    }
+
+    private static void AddBestPositions(
         IReadOnlyList<PositionCandidate> candidates,
-        ManagedRoomType roomType,
         int budget,
         List<PositionCandidate> selected,
-        HashSet<ManagedVegetationShaderPosition> selectedPositions
+        HashSet<ManagedVegetationShaderPosition> selectedPositions,
+        ManagedRoomType? roomType
     )
     {
-        int added = 0;
+        if (
+            budget <= 0
+            || selected.Count
+                >= ConfiguredPositionBudget
+        )
+        {
+            return;
+        }
+
+        int remainingCapacity =
+            Math.Min(
+                budget,
+                ConfiguredPositionBudget
+                    - selected.Count
+            );
+
+        PriorityQueue<
+            PositionCandidate,
+            CandidateSelectionPriority
+        > bestCandidates = new(
+            CandidateWorstFirstPriorityComparer.Instance
+        );
 
         foreach (
             PositionCandidate candidate
@@ -1264,23 +4440,46 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
         )
         {
             if (
-                added >= budget
-                || selected.Count >= MaxUploadedPositions
-            )
-            {
-                return;
-            }
-
-            if (
-                candidate.RoomType != roomType
-                || !selectedPositions.Add(candidate.Position)
+                (
+                    roomType.HasValue
+                    && candidate.RoomType
+                        != roomType.Value
+                )
+                || selectedPositions.Contains(
+                    candidate.Position
+                )
             )
             {
                 continue;
             }
 
-            selected.Add(candidate);
-            added++;
+            bestCandidates.Enqueue(
+                candidate,
+                CandidateSelectionPriority.From(
+                    candidate
+                )
+            );
+
+            if (
+                bestCandidates.Count
+                    > remainingCapacity
+            )
+            {
+                bestCandidates.Dequeue();
+            }
+        }
+
+        while (
+            bestCandidates.TryDequeue(
+                out PositionCandidate candidate,
+                out _
+            )
+        )
+        {
+            if (selectedPositions.Add(candidate.Position))
+            {
+                selected.Add(candidate);
+            }
         }
     }
 
@@ -1310,6 +4509,15 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
         string verificationStage
     )
     {
+        long startTimestamp =
+            Stopwatch.GetTimestamp();
+
+        Interlocked.Increment(
+            ref programDiscoveryRuns
+        );
+
+        bool bridgeWasReady = UniformBridgeReady;
+
         List<ShaderProgramBinding>
             discoveredBindings = new();
 
@@ -1374,15 +4582,14 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
                                 .PositionCountUniformName
                         );
 
-                    string? positionsUniformName =
-                        ResolveArrayUniformName(
-                            program,
-                            StillGreenhousesRoomWindShaderPatch
-                                .PositionsUniformName
-                        );
-
                     positionsFound =
-                        positionsUniformName != null;
+                        HasCellHashUniforms(program);
+
+                    string? positionsUniformName =
+                        positionsFound
+                            ? StillGreenhousesRoomWindShaderPatch
+                                .CellHashTextureUniformName
+                            : null;
 
                     stateCountFound =
                         program.HasUniform(
@@ -1414,7 +4621,7 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
                     else if (!positionsFound)
                     {
                         reason =
-                            "positions-uniform-missing";
+                            "cell-hash-uniform-missing";
                     }
                     else if (!stateCountFound)
                     {
@@ -1540,18 +4747,29 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
             diagnosticHash;
 
         programBindings.Clear();
-
         programBindings.AddRange(
             discoveredBindings
         );
 
-        int vegetationProgramCount =
+        int terrainVegetationProgramCount =
             programBindings.Count(
                 binding =>
-                    IsVegetationProgram(
+                    IsTerrainVegetationProgram(
                         binding.Target
                     )
             );
+
+        int auxiliaryVegetationProgramCount =
+            programBindings.Count(
+                binding =>
+                    IsAuxiliaryVegetationProgram(
+                        binding.Target
+                    )
+            );
+
+        int vegetationProgramCount =
+            terrainVegetationProgramCount
+            + auxiliaryVegetationProgramCount;
 
         int liquidProgramCount =
             programBindings.Count(
@@ -1572,6 +4790,16 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
         );
 
         Volatile.Write(
+            ref activeTerrainVegetationProgramCount,
+            terrainVegetationProgramCount
+        );
+
+        Volatile.Write(
+            ref activeAuxiliaryVegetationProgramCount,
+            auxiliaryVegetationProgramCount
+        );
+
+        Volatile.Write(
             ref activeLiquidProgramCount,
             liquidProgramCount
         );
@@ -1586,6 +4814,27 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
             chunkOpaqueBound ? 1 : 0
         );
 
+        if (
+            bridgeWasReady != chunkOpaqueBound
+            && StillGreenhousesRoomWindEnvironment
+                .IsShaderDrivenMode(
+                    StillGreenhousesClientSystem
+                        .PlantMovementMode
+                )
+        )
+        {
+            int redrawnChunks =
+                StillGreenhousesClientSystem
+                    .RedrawCachedManagedRoomChunksForShaderChange();
+
+            api.Logger.Notification(
+                "[StillGreenhouses] ROOM WIND BRIDGE STATE CHANGED " +
+                $"ready={chunkOpaqueBound}; " +
+                $"redrawnManagedChunks={redrawnChunks}; " +
+                $"fallback={(chunkOpaqueBound ? "room-local-wind" : "vanilla-wind-preserved")}"
+            );
+        }
+
         if (diagnosticsChanged)
         {
             api.Logger.Notification(
@@ -1595,19 +4844,56 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
                 $"activePrograms={programBindings.Count}; " +
                 $"targetPrograms={TargetProgramCount}; " +
                 $"activeVegetationPrograms={vegetationProgramCount}/{VegetationTargetProgramCount}; " +
+                $"activeTerrainVegetationPrograms={terrainVegetationProgramCount}/{TerrainVegetationTargetProgramCount}; " +
+                $"activeAuxiliaryVegetationPrograms={auxiliaryVegetationProgramCount}/{AuxiliaryVegetationTargetProgramCount}; " +
                 $"activeLiquidPrograms={liquidProgramCount}/{LiquidTargetProgramCount}; " +
                 $"topsoilWindConsumer=False; " +
                 $"requiredChunkOpaqueBound={chunkOpaqueBound}; " +
                 $"compiledBridgeVerified={chunkOpaqueBound}; " +
                 $"shaderReloadAttempted={StillGreenhousesRoomWindShaderPatch.ShaderReloadAttempted}; " +
                 $"shaderReloadSucceeded={StillGreenhousesRoomWindShaderPatch.ShaderReloadSucceeded}; " +
-                $"maxUploadedPositions={MaxUploadedPositions}; " +
+                "transport=quarter-block-texture-hash; " +
+                $"hashProbeLimit={RoomWindCellHash.ProbeLimit}; " +
+                $"hashCells={cellHashSnapshot.EntryCount}; " +
+                $"hashCapacity={cellHashSnapshot.Capacity}; " +
                 $"roomTypeStates={UploadedRoomTypeStateCount}"
+            );
+        }
+
+        long elapsedMicroseconds =
+            GetElapsedMicroseconds(
+                startTimestamp
+            );
+
+        Interlocked.Exchange(
+            ref lastProgramDiscoveryMicroseconds,
+            elapsedMicroseconds
+        );
+
+        UpdateMaximum(
+            ref maxProgramDiscoveryMicroseconds,
+            elapsedMicroseconds
+        );
+
+        if (
+            StillGreenhousesClientSystem.Config
+                ?.DebugLogging == true
+            && elapsedMicroseconds >= 2000
+        )
+        {
+            StillGreenhousesClientSystem.DebugLiteral(
+                "[StillGreenhouses] CLIENT PERF " +
+                "operation=render-program-discovery; " +
+                $"elapsedMs={elapsedMicroseconds / 1000d:F3}; " +
+                $"stage={verificationStage}; " +
+                $"targets={TargetProgramCount}; " +
+                $"activePrograms={programBindings.Count}; " +
+                "thread=render"
             );
         }
     }
 
-    private static bool IsVegetationProgram(
+    private static bool IsTerrainVegetationProgram(
         EnumShaderProgram target
     ) =>
         target
@@ -1615,6 +4901,21 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
             or EnumShaderProgram.Chunktransparent
             or EnumShaderProgram.Chunkshadowmap
             or EnumShaderProgram.Chunkshadowmap_NoSSBOs;
+
+    private static bool IsAuxiliaryVegetationProgram(
+        EnumShaderProgram target
+    ) =>
+        target
+            is EnumShaderProgram.Standard
+            or EnumShaderProgram.Entityanimated
+            or EnumShaderProgram.Shadowmapentityanimated
+            or EnumShaderProgram.Entityanimated_Oit;
+
+    private static bool IsVegetationProgram(
+        EnumShaderProgram target
+    ) =>
+        IsTerrainVegetationProgram(target)
+        || IsAuxiliaryVegetationProgram(target);
 
     private static bool IsLiquidProgram(
         EnumShaderProgram target
@@ -1626,36 +4927,126 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
     private static string ResolveProgramRole(
         EnumShaderProgram target
     ) =>
-        IsVegetationProgram(target)
-            ? "Vegetation"
-            : IsLiquidProgram(target)
-                ? "Liquid"
-                : "IncludeOnly";
+        IsTerrainVegetationProgram(target)
+            ? "TerrainVegetation"
+            : IsAuxiliaryVegetationProgram(target)
+                ? "AuxiliaryVegetation"
+                : IsLiquidProgram(target)
+                    ? "Liquid"
+                    : "IncludeOnly";
 
     private static string? ResolveArrayUniformName(
         IShaderProgram program,
         string baseName
     )
     {
-        if (program.HasUniform(baseName))
-        {
-            return baseName;
-        }
-
         string arrayZeroName =
             baseName + "[0]";
 
-        return program.HasUniform(arrayZeroName)
-            ? arrayZeroName
+        // OpenGL specifies the first element as the stable location for a
+        // uniform array. Some drivers also accept the bare array name, but
+        // accepting it in HasUniform() does not guarantee that a bulk upload
+        // using that spelling will address element zero.
+        if (program.HasUniform(arrayZeroName))
+        {
+            return arrayZeroName;
+        }
+
+        return program.HasUniform(baseName)
+            ? baseName
             : null;
     }
 
+    private static bool HasCellHashUniforms(
+        IShaderProgram program
+    ) =>
+        program.HasUniform(
+            StillGreenhousesRoomWindShaderPatch.CellHashTextureUniformName
+        )
+        && program.HasUniform(
+            StillGreenhousesRoomWindShaderPatch.CellHashCapacityUniformName
+        )
+        && program.HasUniform(
+            StillGreenhousesRoomWindShaderPatch.CellHashMaskUniformName
+        )
+        && program.HasUniform(
+            StillGreenhousesRoomWindShaderPatch.CellHashSeedUniformName
+        )
+        && program.HasUniform(
+            StillGreenhousesRoomWindShaderPatch.CellHashTextureWidthUniformName
+        )
+        && program.HasUniform(
+            StillGreenhousesRoomWindShaderPatch.CellHashOriginXUniformName
+        )
+        && program.HasUniform(
+            StillGreenhousesRoomWindShaderPatch.CellHashOriginYUniformName
+        )
+        && program.HasUniform(
+            StillGreenhousesRoomWindShaderPatch.CellHashOriginZUniformName
+        )
+        && program.HasUniform(
+            StillGreenhousesRoomWindShaderPatch.RenderReferenceQuarterXUniformName
+        )
+        && program.HasUniform(
+            StillGreenhousesRoomWindShaderPatch.RenderReferenceQuarterYUniformName
+        )
+        && program.HasUniform(
+            StillGreenhousesRoomWindShaderPatch.RenderReferenceQuarterZUniformName
+        )
+        && program.HasUniform(
+            StillGreenhousesRoomWindShaderPatch.RenderReferenceFractionXUniformName
+        )
+        && program.HasUniform(
+            StillGreenhousesRoomWindShaderPatch.RenderReferenceFractionYUniformName
+        )
+        && program.HasUniform(
+            StillGreenhousesRoomWindShaderPatch.RenderReferenceFractionZUniformName
+        );
+
     private void UploadRoomWindState()
     {
-        float[] stateValues =
-            BuildStateValues();
+        if (cellHashTexture == null)
+        {
+            try
+            {
+                UploadCellHashTexture(cellHashSnapshot);
+                cellHashRevision++;
+            }
+            catch (Exception e)
+            {
+                Volatile.Write(
+                    ref lastUniformUploadFailure,
+                    $"CellHashTexture:{e.GetType().Name}:{e.Message}"
+                );
+                return;
+            }
+        }
+
+        FillStateValues(
+            stateValueBuffer
+        );
+
+        LoadedTexture activeCellHashTexture = cellHashTexture
+            ?? throw new InvalidOperationException(
+                "The room-wind cell hash texture was not created."
+            );
+
+        long startTimestamp =
+            Stopwatch.GetTimestamp();
 
         bool anyUploadSucceeded = false;
+        bool anyUploadFailed = false;
+        bool bindingsChanged = false;
+        int programBindOperations = 0;
+
+        int debugMode =
+            StillGreenhousesClientSystem.Config
+                ?.DebugRoomWindCallSiteProof == true
+                    ? 2
+                    : StillGreenhousesClientSystem.Config
+                        ?.DebugRoomWindVisualProof == true
+                            ? 1
+                            : 0;
 
         for (
             int i = programBindings.Count - 1;
@@ -1669,64 +5060,126 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
             if (binding.Program.Disposed)
             {
                 programBindings.RemoveAt(i);
+                bindingsChanged = true;
+                nextProgramDiscoveryMs = 0;
 
                 continue;
             }
 
             try
             {
-                binding.Program.Use();
+                bool hashChanged =
+                    binding.LastUploadedTopologyRevision
+                        != cellHashRevision;
+                bool stateChanged =
+                    binding.LastUploadedStateRevision
+                        != stateRevision;
+                bool referenceChanged =
+                    binding.LastUploadedRenderReferenceRevision
+                        != renderReferenceRevision;
+                bool debugChanged =
+                    binding.DebugVisualProofUniformFound
+                    && binding.LastUploadedDebugMode != debugMode;
 
                 if (
-                    binding.LastUploadedTopologyRevision
-                        != topology.Revision
+                    !hashChanged
+                    && !stateChanged
+                    && !referenceChanged
+                    && !debugChanged
                 )
+                {
+                    continue;
+                }
+
+                binding.Program.Use();
+                programBindOperations++;
+
+                binding.Program.BindTexture2D(
+                    StillGreenhousesRoomWindShaderPatch
+                        .CellHashTextureUniformName,
+                    activeCellHashTexture.TextureId,
+                    CellHashTextureUnit
+                );
+
+                if (hashChanged)
                 {
                     binding.Program.Uniform(
                         StillGreenhousesRoomWindShaderPatch
                             .PositionCountUniformName,
-                        topology.PositionCount
+                        cellHashSnapshot.EntryCount
+                    );
+                    binding.Program.Uniform(
+                        StillGreenhousesRoomWindShaderPatch
+                            .CellHashCapacityUniformName,
+                        cellHashSnapshot.Capacity
+                    );
+                    binding.Program.Uniform(
+                        StillGreenhousesRoomWindShaderPatch
+                            .CellHashMaskUniformName,
+                        cellHashSnapshot.Mask
+                    );
+                    binding.Program.Uniform(
+                        StillGreenhousesRoomWindShaderPatch
+                            .CellHashSeedUniformName,
+                        unchecked((int)cellHashSnapshot.Seed)
+                    );
+                    binding.Program.Uniform(
+                        StillGreenhousesRoomWindShaderPatch
+                            .CellHashTextureWidthUniformName,
+                        cellHashSnapshot.Width
+                    );
+                    binding.Program.Uniform(
+                        StillGreenhousesRoomWindShaderPatch
+                            .CellHashOriginXUniformName,
+                        cellHashSnapshot.Origin.X
+                    );
+                    binding.Program.Uniform(
+                        StillGreenhousesRoomWindShaderPatch
+                            .CellHashOriginYUniformName,
+                        cellHashSnapshot.Origin.Y
+                    );
+                    binding.Program.Uniform(
+                        StillGreenhousesRoomWindShaderPatch
+                            .CellHashOriginZUniformName,
+                        cellHashSnapshot.Origin.Z
+                    );
+                    binding.LastUploadedTopologyRevision =
+                        cellHashRevision;
+                }
+
+                if (referenceChanged)
+                {
+                    UploadRenderReferenceUniforms(binding.Program);
+                    binding.LastUploadedRenderReferenceRevision =
+                        renderReferenceRevision;
+                }
+
+                if (debugChanged)
+                {
+                    binding.Program.Uniform(
+                        StillGreenhousesRoomWindShaderPatch
+                            .DebugVisualProofUniformName,
+                        debugMode
                     );
 
+                    binding.LastUploadedDebugMode =
+                        debugMode;
+                }
+
+                if (stateChanged)
+                {
                     binding.Program.Uniform(
                         StillGreenhousesRoomWindShaderPatch
                             .StateCountUniformName,
                         UploadedRoomTypeStateCount
                     );
-
-                    if (
-                        topology.PositionCount
-                            > 0
-                    )
-                    {
-                        binding.Program.Uniforms4(
-                            binding.PositionsUniformName,
-                            topology.PositionCount,
-                            topology.PositionValues
-                        );
-                    }
-
-                    binding.LastUploadedTopologyRevision =
-                        topology.Revision;
-                }
-
-                if (binding.DebugVisualProofUniformFound)
-                {
-                    binding.Program.Uniform(
-                        StillGreenhousesRoomWindShaderPatch
-                            .DebugVisualProofUniformName,
-                        StillGreenhousesClientSystem.Config
-                            ?.DebugRoomWindVisualProof == true
-                                ? 1
-                                : 0
+                    binding.Program.Uniforms4(
+                        binding.StatesUniformName,
+                        UploadedShaderStateVectorCount,
+                        stateValueBuffer
                     );
+                    binding.LastUploadedStateRevision = stateRevision;
                 }
-
-                binding.Program.Uniforms4(
-                    binding.StatesUniformName,
-                    UploadedRoomTypeStateCount,
-                    stateValues
-                );
 
                 binding.Program.Stop();
 
@@ -1734,6 +5187,10 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
             }
             catch (Exception e)
             {
+                anyUploadFailed = true;
+                bindingsChanged = true;
+                nextProgramDiscoveryMs = 0;
+
                 try
                 {
                     binding.Program.Stop();
@@ -1750,42 +5207,189 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
                     $"error={e.GetType().Name}:{e.Message}"
                 );
 
+                Volatile.Write(
+                    ref lastUniformUploadFailure,
+                    $"{binding.Target}:" +
+                    $"{e.GetType().Name}:" +
+                    e.Message.Replace('\r', ' ')
+                        .Replace('\n', ' ')
+                );
+
                 programBindings.RemoveAt(i);
             }
         }
 
-        bool chunkOpaqueBound =
-            programBindings.Any(
-                binding =>
-                    binding.Target
-                        == EnumShaderProgram.Chunkopaque
-                    && !binding.Program.Disposed
+        // The sampler uniform is persistent, but OpenGL texture-unit bindings
+        // are global state. Refresh the high-numbered unit once per frame when
+        // no program needed a metadata upload; this replaces the previous nine
+        // Use/Stop pairs per frame with one bounded operation.
+        if (
+            programBindOperations == 0
+            && cellHashTexture != null
+        )
+        {
+            foreach (ShaderProgramBinding binding in programBindings)
+            {
+                if (binding.Program.Disposed)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    binding.Program.Use();
+                    binding.Program.BindTexture2D(
+                        StillGreenhousesRoomWindShaderPatch
+                            .CellHashTextureUniformName,
+                        activeCellHashTexture.TextureId,
+                        CellHashTextureUnit
+                    );
+                    binding.Program.Stop();
+                    programBindOperations++;
+                    anyUploadSucceeded = true;
+                    break;
+                }
+                catch
+                {
+                    try
+                    {
+                        binding.Program.Stop();
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+        }
+
+        if (
+            anyUploadSucceeded
+            && !anyUploadFailed
+        )
+        {
+            Volatile.Write(
+                ref lastUniformUploadFailure,
+                "<none>"
             );
+        }
+
+        if (bindingsChanged)
+        {
+            PublishProgramBindingMetrics();
+        }
+
+        Volatile.Write(
+            ref uploadedRoomStateCount,
+            anyUploadSucceeded
+                ? UploadedRoomTypeStateCount
+                : 0
+        );
+
+        Interlocked.Increment(
+            ref uniformUploadRuns
+        );
+
+        Interlocked.Add(
+            ref uniformProgramBindOperations,
+            programBindOperations
+        );
+
+        long elapsedMicroseconds =
+            GetElapsedMicroseconds(
+                startTimestamp
+            );
+
+        Interlocked.Exchange(
+            ref lastUniformUploadMicroseconds,
+            elapsedMicroseconds
+        );
+
+        UpdateMaximum(
+            ref maxUniformUploadMicroseconds,
+            elapsedMicroseconds
+        );
+
+        if (
+            StillGreenhousesClientSystem.Config
+                ?.DebugLogging == true
+            && elapsedMicroseconds >= 2000
+        )
+        {
+            StillGreenhousesClientSystem.DebugLiteral(
+                "[StillGreenhouses] CLIENT PERF " +
+                "operation=render-uniform-upload; " +
+                $"elapsedMs={elapsedMicroseconds / 1000d:F3}; " +
+                $"programBindings={programBindings.Count}; " +
+                $"programUseStopPairs={programBindOperations}; " +
+                $"topologyRevision={topology.Revision}; " +
+                "thread=render"
+            );
+        }
+    }
+
+    private void PublishProgramBindingMetrics()
+    {
+        bool chunkOpaqueBound = false;
+        int terrainVegetationProgramCount = 0;
+        int auxiliaryVegetationProgramCount = 0;
+        int liquidProgramCount = 0;
+
+        foreach (
+            ShaderProgramBinding binding
+            in programBindings
+        )
+        {
+            if (binding.Program.Disposed)
+            {
+                continue;
+            }
+
+            if (
+                binding.Target
+                    == EnumShaderProgram.Chunkopaque
+            )
+            {
+                chunkOpaqueBound = true;
+            }
+
+            if (IsTerrainVegetationProgram(binding.Target))
+            {
+                terrainVegetationProgramCount++;
+            }
+            else if (IsAuxiliaryVegetationProgram(binding.Target))
+            {
+                auxiliaryVegetationProgramCount++;
+            }
+            else if (IsLiquidProgram(binding.Target))
+            {
+                liquidProgramCount++;
+            }
+        }
 
         int vegetationProgramCount =
-            programBindings.Count(
-                binding =>
-                    IsVegetationProgram(
-                        binding.Target
-                    )
-            );
-
-        int liquidProgramCount =
-            programBindings.Count(
-                binding =>
-                    IsLiquidProgram(
-                        binding.Target
-                    )
-            );
+            terrainVegetationProgramCount
+            + auxiliaryVegetationProgramCount;
 
         Volatile.Write(
             ref activeProgramCount,
-            programBindings.Count
+            terrainVegetationProgramCount
+            + auxiliaryVegetationProgramCount
+            + liquidProgramCount
         );
 
         Volatile.Write(
             ref activeVegetationProgramCount,
             vegetationProgramCount
+        );
+
+        Volatile.Write(
+            ref activeTerrainVegetationProgramCount,
+            terrainVegetationProgramCount
+        );
+
+        Volatile.Write(
+            ref activeAuxiliaryVegetationProgramCount,
+            auxiliaryVegetationProgramCount
         );
 
         Volatile.Write(
@@ -1802,21 +5406,49 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
             ref uniformBridgeReady,
             chunkOpaqueBound ? 1 : 0
         );
+    }
 
-        Volatile.Write(
-            ref uploadedRoomStateCount,
-            anyUploadSucceeded
-                ? UploadedRoomTypeStateCount
-                : 0
+    private void UploadRenderReferenceUniforms(
+        IShaderProgram program
+    )
+    {
+        program.Uniform(
+            StillGreenhousesRoomWindShaderPatch
+                .RenderReferenceQuarterXUniformName,
+            renderReferenceQuarterX
+        );
+        program.Uniform(
+            StillGreenhousesRoomWindShaderPatch
+                .RenderReferenceQuarterYUniformName,
+            renderReferenceQuarterY
+        );
+        program.Uniform(
+            StillGreenhousesRoomWindShaderPatch
+                .RenderReferenceQuarterZUniformName,
+            renderReferenceQuarterZ
+        );
+        program.Uniform(
+            StillGreenhousesRoomWindShaderPatch
+                .RenderReferenceFractionXUniformName,
+            renderReferenceQuarterFractionX
+        );
+        program.Uniform(
+            StillGreenhousesRoomWindShaderPatch
+                .RenderReferenceFractionYUniformName,
+            renderReferenceQuarterFractionY
+        );
+        program.Uniform(
+            StillGreenhousesRoomWindShaderPatch
+                .RenderReferenceFractionZUniformName,
+            renderReferenceQuarterFractionZ
         );
     }
 
-    private float[] BuildStateValues()
+    private void FillStateValues(
+        float[] values
+    )
     {
-        float[] values =
-            new float[
-                UploadedRoomTypeStateCount * 4
-            ];
+        float timeCounter = api.Render.ShaderUniforms.TimeCounter;
 
         for (
             int i = 0;
@@ -1834,17 +5466,32 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
             values[offset] =
                 snapshot.WindSpeed;
 
+            float regularRate =
+                0.5f + 2f * snapshot.WindSpeed;
+
+            float highFrequencyRate =
+                (0.4f + snapshot.WindSpeed / 10f)
+                * (0.5f + 5f * snapshot.WindSpeed);
+
+            // Y and Z are phase offsets. The patched shader adds timeCounter
+            // times the room-local rate, so motion remains continuous without
+            // rebinding every target shader program on every frame.
             values[offset + 1] =
-                snapshot.WindWaveCounter;
+                snapshot.WindWaveCounter
+                - timeCounter * regularRate;
 
             values[offset + 2] =
-                snapshot.WindWaveCounterHighFreq;
+                snapshot.WindWaveCounterHighFreq
+                - timeCounter * highFrequencyRate;
 
+            // A negative W component is the shader's explicit exact-no-wind
+            // marker. WindSpeed=0 alone is insufficient because Vanilla modes
+            // 1, 2, and 13 retain a small baseline strength at zero wind.
             values[offset + 3] =
-                snapshot.CurrentPercent;
+                snapshot.CurrentPercent <= 0.0001f
+                    ? -1f
+                    : snapshot.CurrentPercent;
         }
-
-        return values;
     }
 
     private static ulong AddHash(
@@ -1886,6 +5533,9 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
         }
 
         programBindings.Clear();
+        compactedRegistrations.Clear();
+        compactedRegistrationRevision = int.MinValue;
+        DisposeCellHashTexture();
 
         Volatile.Write(
             ref activeProgramCount,
@@ -1894,6 +5544,16 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
 
         Volatile.Write(
             ref activeVegetationProgramCount,
+            0
+        );
+
+        Volatile.Write(
+            ref activeTerrainVegetationProgramCount,
+            0
+        );
+
+        Volatile.Write(
+            ref activeAuxiliaryVegetationProgramCount,
             0
         );
 
@@ -1916,11 +5576,23 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
             ref uploadedRoomStateCount,
             0
         );
+
+        Volatile.Write(
+            ref compactedEnvelopeCount,
+            0
+        );
+
+        Volatile.Write(
+            ref uploadedCoveredPositionCount,
+            0
+        );
     }
 
     private sealed class RoomWindRuntimeState
     {
         internal ManagedRoomType RoomType { get; }
+
+        internal RoomWindTargetKind Target { get; }
 
         internal float LowerPercent { get; }
 
@@ -1947,6 +5619,7 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
 
         internal RoomWindRuntimeState(
             ManagedRoomType roomType,
+            RoomWindTargetKind target,
             RoomWindRange range,
             float initialWindWaveCounter,
             float initialWindWaveCounterHighFreq,
@@ -1954,6 +5627,7 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
         )
         {
             RoomType = roomType;
+            Target = target;
             LowerPercent = range.LowerPercent;
             UpperPercent = range.UpperPercent;
             CurrentPercent = LowerPercent;
@@ -1974,15 +5648,14 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
                     );
         }
 
-        internal void Advance(
-            float scaledDt,
-            float glitchStrength
-        )
+        internal bool Advance(float scaledDt)
         {
             if (scaledDt <= 0f)
             {
-                return;
+                return false;
             }
+
+            float previousPercent = CurrentPercent;
 
             AdvanceWindTarget(
                 scaledDt
@@ -1991,9 +5664,10 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
             float windSpeed =
                 WindSpeed;
 
-            // Mirrors the surface-wind-driven portions of
-            // DefaultShaderUniforms.Update(), with this room-type state's
-            // current wind speed substituted for the global surface wind.
+            // Room phases intentionally depend only on the room-local speed.
+            // The shader advances these same rates from timeCounter, allowing
+            // the six state vectors to be uploaded only when a configured
+            // range actually steps instead of once per render frame.
             windWaveCounter =
                 (
                     windWaveCounter
@@ -2001,7 +5675,6 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
                         0.5f
                         + 2f
                         * windSpeed
-                        * (1f - glitchStrength)
                     )
                     * scaledDt
                 )
@@ -2019,11 +5692,12 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
                         0.5f
                         + 5f
                         * windSpeed
-                        * (1f - glitchStrength)
                     )
                     * scaledDt
                 )
                 % 6000f;
+
+            return Math.Abs(CurrentPercent - previousPercent) > 0.0001f;
         }
 
         private void AdvanceWindTarget(
@@ -2121,6 +5795,15 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
         internal int LastUploadedTopologyRevision { get; set; } =
             int.MinValue;
 
+        internal int LastUploadedStateRevision { get; set; } =
+            int.MinValue;
+
+        internal int LastUploadedRenderReferenceRevision { get; set; } =
+            int.MinValue;
+
+        internal int LastUploadedDebugMode { get; set; } =
+            int.MinValue;
+
         internal ShaderProgramBinding(
             EnumShaderProgram target,
             IShaderProgram program,
@@ -2144,7 +5827,163 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
         ManagedVegetationShaderPosition Position,
         ManagedRoomType RoomType,
         RoomWindTargetKind Targets,
+        ManagedRoomWindEnvelope Envelope,
+        int CoveredPositionCount,
         double DistanceSquared
+    );
+
+    private readonly record struct CompactionRunKey(
+        ChunkKey Chunk,
+        int Y,
+        int Z,
+        GreenhouseKey RoomKey,
+        ManagedRoomType RoomType,
+        RoomWindTargetKind Targets,
+        ManagedRoomWindEnvelope Envelope
+    );
+
+    private readonly record struct EncodedEnvelopeBounds(
+        double MinX,
+        double MinY,
+        double MinZ,
+        double MaxX,
+        double MaxY,
+        double MaxZ
+    )
+    {
+        internal bool Overlaps(
+            EncodedEnvelopeBounds other
+        ) =>
+            MinX <= other.MaxX
+            && MaxX >= other.MinX
+            && MinY <= other.MaxY
+            && MaxY >= other.MinY
+            && MinZ <= other.MaxZ
+            && MaxZ >= other.MinZ;
+    }
+
+    private readonly record struct EncodedEnvelopeBucketKey(
+        int X,
+        int Y,
+        int Z,
+        int Dimension
+    );
+
+    private readonly record struct EnvelopeBucketRange(
+        int MinX,
+        int MinY,
+        int MinZ,
+        int MaxX,
+        int MaxY,
+        int MaxZ
+    );
+
+    private readonly record struct CandidateSelectionPriority(
+        bool IsVegetation,
+        double DistanceSquared,
+        int Dimension,
+        int X,
+        int Y,
+        int Z,
+        int Targets,
+        int RoomType
+    )
+    {
+        internal static CandidateSelectionPriority From(
+            PositionCandidate candidate
+        ) =>
+            new(
+                (
+                    candidate.Targets
+                    & RoomWindTargetKind.Vegetation
+                ) != 0,
+                candidate.DistanceSquared,
+                candidate.Position.Dimension,
+                candidate.Position.X,
+                candidate.Position.Y,
+                candidate.Position.Z,
+                (int)candidate.Targets,
+                (int)candidate.RoomType
+            );
+    }
+
+    private sealed class CandidateBestFirstPriorityComparer :
+        IComparer<CandidateSelectionPriority>
+    {
+        internal static CandidateBestFirstPriorityComparer Instance { get; } =
+            new();
+
+        public int Compare(
+            CandidateSelectionPriority left,
+            CandidateSelectionPriority right
+        )
+        {
+            int vegetationComparison =
+                right.IsVegetation.CompareTo(
+                    left.IsVegetation
+                );
+
+            if (vegetationComparison != 0)
+            {
+                return vegetationComparison;
+            }
+
+            int comparison =
+                left.DistanceSquared.CompareTo(
+                    right.DistanceSquared
+                );
+
+            if (comparison != 0) return comparison;
+
+            comparison = left.Dimension.CompareTo(
+                right.Dimension
+            );
+
+            if (comparison != 0) return comparison;
+
+            comparison = left.X.CompareTo(right.X);
+            if (comparison != 0) return comparison;
+
+            comparison = left.Y.CompareTo(right.Y);
+            if (comparison != 0) return comparison;
+
+            comparison = left.Z.CompareTo(right.Z);
+            if (comparison != 0) return comparison;
+
+            comparison = left.Targets.CompareTo(
+                right.Targets
+            );
+
+            return comparison != 0
+                ? comparison
+                : left.RoomType.CompareTo(
+                    right.RoomType
+                );
+        }
+    }
+
+    private sealed class CandidateWorstFirstPriorityComparer :
+        IComparer<CandidateSelectionPriority>
+    {
+        internal static CandidateWorstFirstPriorityComparer Instance { get; } =
+            new();
+
+        public int Compare(
+            CandidateSelectionPriority left,
+            CandidateSelectionPriority right
+        ) =>
+            -CandidateBestFirstPriorityComparer
+                .Instance
+                .Compare(
+                    left,
+                    right
+                );
+    }
+
+    private readonly record struct ReservedPositionBudgets(
+        int Greenhouse,
+        int Cellar,
+        int Room
     );
 
     private readonly record struct ProgramDiagnostic(
@@ -2163,7 +6002,8 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
     private sealed record RoomWindTopologySnapshot(
         float[] PositionValues,
         int PositionCount,
-        int TotalValid,
+        int TotalCompactedEnvelopes,
+        int TotalValidPositions,
         ulong ContentHash,
         int Revision
     )
@@ -2171,6 +6011,7 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
         internal static RoomWindTopologySnapshot Empty { get; } =
             new(
                 Array.Empty<float>(),
+                0,
                 0,
                 0,
                 0UL,
@@ -2185,11 +6026,22 @@ internal sealed class StillGreenhousesRoomWindUniformRenderer :
 // chunkshadowmap pass vertex+origin into applyVertexWarping(). Vanilla then
 // derives absolute world position as worldPos+playerpos inside vertexwarp.vsh.
 //
-// 0.10.16a therefore keeps Vanilla's original WindMode/WindData switch intact,
-// substitutes the room-local wind speed and counters inside applyVertexWarping,
-// and wraps the active top-level call sites. The wrapper scales the complete
-// Vanilla vertex-warp delta by the room's normalized wind speed. This also
-// scales modes whose branch math hardcodes strength or sets strength to zero.
+// 0.17.2 keeps Vanilla's original WindMode/WindData switch intact and
+// substitutes room-local wind speed and counters inside applyVertexWarping().
+// 0.18 keeps those measured mesh envelopes but transports their rasterized
+// absolute cells through a bounded-probe texture hash. Vegetation and water
+// occupy independent payload bits and can never consume each other's budget.
+//
+// After Vanilla selects the native wind-mode branch, mode-aware correction
+// normalizes only modes whose branch formulas do not interpret windSpeed as a
+// direct movement-strength input. Modes 1, 2, and 13 remain fully Vanilla.
+// Terrain call sites stay wrapped only for diagnostic proof transforms. Normal
+// rendering uses the corrected native warp directly; there is no universal
+// post-warp room-amplitude multiplier.
+//
+// Standard and Entityanimated-family programs are optional uniform consumers
+// because their Vanilla shaders also include vertexwarp.vsh and call
+// applyVertexWarping(). Chunkopaque remains the core bridge-readiness gate.
 //
 // chunktopsoil includes vertexwarp.vsh but deliberately does not call
 // applyVertexWarping(); it is audited and excluded from active vegetation
@@ -2205,6 +6057,48 @@ internal static partial class StillGreenhousesRoomWindShaderPatch
     internal const string PositionsUniformName =
         "stillGreenhousesRoomWindPositions";
 
+    internal const string CellHashTextureUniformName =
+        "stillGreenhousesRoomWindCellHash";
+
+    internal const string CellHashCapacityUniformName =
+        "stillGreenhousesRoomWindCellHashCapacity";
+
+    internal const string CellHashMaskUniformName =
+        "stillGreenhousesRoomWindCellHashMask";
+
+    internal const string CellHashSeedUniformName =
+        "stillGreenhousesRoomWindCellHashSeed";
+
+    internal const string CellHashTextureWidthUniformName =
+        "stillGreenhousesRoomWindCellHashTextureWidth";
+
+    internal const string CellHashOriginXUniformName =
+        "stillGreenhousesRoomWindCellHashOriginX";
+
+    internal const string CellHashOriginYUniformName =
+        "stillGreenhousesRoomWindCellHashOriginY";
+
+    internal const string CellHashOriginZUniformName =
+        "stillGreenhousesRoomWindCellHashOriginZ";
+
+    internal const string RenderReferenceQuarterXUniformName =
+        "stillGreenhousesRoomWindReferenceQuarterX";
+
+    internal const string RenderReferenceQuarterYUniformName =
+        "stillGreenhousesRoomWindReferenceQuarterY";
+
+    internal const string RenderReferenceQuarterZUniformName =
+        "stillGreenhousesRoomWindReferenceQuarterZ";
+
+    internal const string RenderReferenceFractionXUniformName =
+        "stillGreenhousesRoomWindReferenceFractionX";
+
+    internal const string RenderReferenceFractionYUniformName =
+        "stillGreenhousesRoomWindReferenceFractionY";
+
+    internal const string RenderReferenceFractionZUniformName =
+        "stillGreenhousesRoomWindReferenceFractionZ";
+
     internal const string StateCountUniformName =
         "stillGreenhousesRoomWindStateCount";
 
@@ -2218,13 +6112,16 @@ internal static partial class StillGreenhousesRoomWindShaderPatch
         "applyVertexWarping";
 
     private const string PatchMarker =
-        "StillGreenhouses Vanilla room wind delta scale bridge";
+        "StillGreenhouses Vanilla room wind render reference bridge";
+
+    private const string ModeAwareCorrectionMarker =
+        "StillGreenhouses mode-aware room amplitude correction";
 
     private const string CallSiteWrapperFunctionName =
-        "applyStillGreenhousesRoomWindScale";
+        "applyStillGreenhousesRoomWindPostWarp";
 
     private const string CallSitePatchMarker =
-        "StillGreenhouses Vanilla warp room amplitude callsite";
+        "StillGreenhouses Vanilla warp managed proof callsite";
 
     private const string TargetLiquidFunctionName =
         "applyLiquidWarping";
@@ -2236,7 +6133,7 @@ internal static partial class StillGreenhousesRoomWindShaderPatch
         "StillGreenhouses";
 
     private const string OverrideOriginFolder =
-        "shader-origin-0.10.16a";
+            "shader-origin-0.18.0";
 
     private const int MaxFunctionSourceChunkCharacters =
         2200;
@@ -2413,10 +6310,10 @@ internal static partial class StillGreenhousesRoomWindShaderPatch
         ) != 0;
 
     internal static string ShaderTopology =>
-        "VanillaWarpThenRoomAmplitudeMix";
+        "VanillaNativeWarpWithRoomLocalEnvironmentAndCellHash";
 
     internal static string AbsolutePositionStrategy =>
-        "VanillaPlayerReferenceAbsoluteBlockAabb";
+        "AbsoluteQuarterBlockCellHashWithRenderReferenceReconstruction";
 
     internal static int FunctionSourceChunksLogged =>
         Volatile.Read(
@@ -2635,8 +6532,8 @@ internal static partial class StillGreenhousesRoomWindShaderPatch
                 + $"applyVertexWarpingCalls={applyVertexWarpingCalls}; "
                 + $"wrappedCalls={wrappedCalls}; "
                 + $"expectedCalls={callSiteAsset.ExpectedCalls}; "
-                + "topology=VanillaWarpThenRoomAmplitudeMix; "
-                + "absolutePosition=worldPos+playerpos"
+                + "topology=VanillaNativeWarpWithRoomEnvironmentalInputs; "
+                + "positionMatch=worldPos+playerpos/playerReferencePos-relative-wind-vertex-envelopes"
             );
         }
 
@@ -2947,8 +6844,8 @@ internal static partial class StillGreenhousesRoomWindShaderPatch
         api.Logger.Notification(
             "[StillGreenhouses] ROOM WIND SHADER ORIGIN PREPARED "
             + $"location={TargetAssetLocation}; "
-            + "strategy=vanilla-warp-then-room-amplitude-mix; "
-            + "absolutePosition=worldPos+playerpos; "
+            + "strategy=vanilla-native-warp-with-room-environmental-inputs; "
+            + "positionMatch=bounded-quarter-block-texture-hash; "
             + $"originPath={originRoot}; "
             + $"originPriorityIndex={priorityIndex}; "
             + $"baseSourceSetHash={BaseSourceHash}; "
@@ -2961,7 +6858,7 @@ internal static partial class StillGreenhousesRoomWindShaderPatch
             + $"windSpeedUses={patchedWindSpeedUses}; "
             + $"windWaveCounterUses={patchedWindWaveCounterUses}; "
             + $"highFreqCounterUses={patchedHighFreqUses}; "
-            + $"maxUploadedPositions={StillGreenhousesRoomWindUniformRenderer.MaxUploadedPositions}; "
+            + $"hashProbeLimit={RoomWindCellHash.ProbeLimit}; "
             + $"roomTypeStateCount={StillGreenhousesRoomWindEnvironment.RoomTypeStateCount}"
         );
 
@@ -3203,7 +7100,18 @@ internal static partial class StillGreenhousesRoomWindShaderPatch
         return resolved;
     }
 
-    internal static bool ReloadCompiledShaders(
+    // The shader origin is registered during Start(), before normal asset
+    // resolution. Once BlockTexturesLoaded confirms that all resolved shader
+    // assets match that origin, no global shader reload is required.
+    //
+    // Calling IShaderAPI.ReloadShaders() here used to rebuild every engine
+    // program during login. On mod-heavy clients this can leave animated
+    // programs without their native Animation UBO metadata, after which
+    // AnimatableRenderer crashes while indexing prog.UBOs["Animation"].
+    // Compiled bridge verification remains authoritative: if the engine did
+    // not compile the prepared override, the room-wind environment stays
+    // inactive and safely falls back to Vanilla rendering.
+    internal static bool FinalizePreparedShaderLifecycle(
         ICoreClientAPI api,
         string stage
     )
@@ -3221,15 +7129,20 @@ internal static partial class StillGreenhousesRoomWindShaderPatch
         if (!Ready)
         {
             Volatile.Write(
+                ref shaderReloadSucceeded,
+                0
+            );
+
+            Volatile.Write(
                 ref shaderReloadFailureReason,
                 "shader-override-not-resolved"
             );
 
             api.Logger.Notification(
-                "[StillGreenhouses] ROOM WIND SHADER RELOAD " +
+                "[StillGreenhouses] ROOM WIND SHADER LIFECYCLE " +
                 $"stage={stage}; " +
-                "attempted=True; " +
-                "success=False; " +
+                "globalReload=False; " +
+                "ready=False; " +
                 $"originPrepared={OriginPrepared}; " +
                 $"overrideResolved={OverrideResolved}; " +
                 $"sourceHash={ResolvedOverrideSourceHash}; " +
@@ -3239,53 +7152,33 @@ internal static partial class StillGreenhousesRoomWindShaderPatch
             return false;
         }
 
-        bool success = false;
-        string reason = "<none>";
-
-        try
-        {
-            success =
-                api.Shader.ReloadShaders();
-
-            if (!success)
-            {
-                reason =
-                    "ReloadShaders-returned-false";
-            }
-        }
-        catch (Exception e)
-        {
-            reason =
-                $"{e.GetType().Name}:{Sanitize(e.Message)}";
-        }
-
         Volatile.Write(
             ref shaderReloadSucceeded,
-            success ? 1 : 0
+            1
         );
 
         Volatile.Write(
             ref shaderReloadFailureReason,
-            reason
+            "<global-reload-not-required>"
         );
 
         Volatile.Write(
             ref compiledVerificationPending,
-            success ? 1 : 0
+            1
         );
 
         api.Logger.Notification(
-            "[StillGreenhouses] ROOM WIND SHADER RELOAD " +
+            "[StillGreenhouses] ROOM WIND SHADER LIFECYCLE " +
             $"stage={stage}; " +
-            "attempted=True; " +
-            $"success={success}; " +
+            "globalReload=False; " +
+            "ready=True; " +
             $"originPrepared={OriginPrepared}; " +
             $"overrideResolved={OverrideResolved}; " +
             $"sourceHash={ResolvedOverrideSourceHash}; " +
-            $"reason={reason}"
+            "reason=early-asset-origin-already-resolved"
         );
 
-        return success;
+        return true;
     }
 
     internal static void RemoveAssetOrigin(
@@ -3297,6 +7190,8 @@ internal static partial class StillGreenhousesRoomWindShaderPatch
 
         if (originPath == "<none>")
         {
+            ResetClientLifecycleState();
+
             return;
         }
 
@@ -3312,6 +7207,42 @@ internal static partial class StillGreenhousesRoomWindShaderPatch
             // Disposal must not fail because the asset manager is already
             // shutting down or the origin has already been removed.
         }
+        finally
+        {
+            ResetClientLifecycleState();
+        }
+    }
+
+    private static void ResetClientLifecycleState()
+    {
+        PreparedOverrideAssetHashes.Clear();
+
+        Volatile.Write(ref originPreparationAttempted, 0);
+        Volatile.Write(ref originPrepared, 0);
+        Volatile.Write(ref overrideResolved, 0);
+        Volatile.Write(ref overrideMarkerPresent, 0);
+        Volatile.Write(ref overrideMatchesPreparedHash, 0);
+        Volatile.Write(ref originPriorityIndex, -1);
+        Volatile.Write(ref shaderReloadAttempted, 0);
+        Volatile.Write(ref shaderReloadSucceeded, 0);
+        Volatile.Write(ref compiledVerificationPending, 0);
+        Volatile.Write(ref windSpeedReplacements, 0);
+        Volatile.Write(ref windWaveCounterReplacements, 0);
+        Volatile.Write(ref highFreqCounterReplacements, 0);
+        Volatile.Write(ref functionSourceChunksLogged, 0);
+        Volatile.Write(ref overrideAssetCount, 0);
+        Volatile.Write(ref callSiteAssetsPatched, 0);
+        Volatile.Write(ref callSiteCallsWrapped, 0);
+        Volatile.Write(ref topsoilActiveVertexWarpCalls, 0);
+        Volatile.Write(ref topsoilCommentedVertexWarpDetected, 0);
+
+        Volatile.Write(ref lastFailureReason, "<none>");
+        Volatile.Write(ref shaderReloadFailureReason, "<not-attempted>");
+        Volatile.Write(ref overrideOriginPath, "<none>");
+        Volatile.Write(ref resolvedAssetOriginPath, "<none>");
+        Volatile.Write(ref baseSourceHash, "<none>");
+        Volatile.Write(ref preparedOverrideSourceHash, "<none>");
+        Volatile.Write(ref resolvedOverrideSourceHash, "<none>");
     }
 
     private static bool PublishOriginPreparationFailure(
@@ -3737,7 +7668,7 @@ internal static partial class StillGreenhousesRoomWindShaderPatch
 
         diagnostic =
             "reason=<none>; "
-            + "topology=VanillaWarpThenRoomAmplitudeMix";
+            + "topology=VanillaNativeWarpWithRoomEnvironmentalInputs";
 
         return true;
     }
@@ -3921,6 +7852,40 @@ internal static partial class StillGreenhousesRoomWindShaderPatch
         );
     }
 
+    internal static bool TryPatchVertexWarpSourceForChecks(
+        string source,
+        out string patchedSource,
+        out string diagnostic
+    )
+    {
+        if (!TryPatchSource(
+                source,
+                out patchedSource,
+                out diagnostic,
+                out _,
+                out _,
+                out _,
+                out _
+            ))
+        {
+            return false;
+        }
+
+        if (!TryPatchLiquidWarping(
+                patchedSource,
+                out string liquidPatchedSource,
+                out string liquidDiagnostic
+            ))
+        {
+            diagnostic += "; liquid=" + liquidDiagnostic;
+            return false;
+        }
+
+        patchedSource = liquidPatchedSource;
+        diagnostic += "; liquid=" + liquidDiagnostic;
+        return true;
+    }
+
     private static bool TryPatchSource(
         string source,
         out string patchedSource,
@@ -4012,6 +7977,54 @@ internal static partial class StillGreenhousesRoomWindShaderPatch
             return false;
         }
 
+        int windModeSwitchOpenParen =
+            FindNextNonWhitespace(
+                functionSource,
+                windModeSwitchIndex + "switch".Length
+            );
+
+        int windModeSwitchCloseParen =
+            windModeSwitchOpenParen < 0
+                ? -1
+                : FindMatchingDelimiter(
+                    functionSource,
+                    windModeSwitchOpenParen,
+                    '(',
+                    ')'
+                );
+
+        int windModeSwitchOpenBrace =
+            windModeSwitchCloseParen < 0
+                ? -1
+                : FindNextNonWhitespace(
+                    functionSource,
+                    windModeSwitchCloseParen + 1
+                );
+
+        int windModeSwitchCloseBrace =
+            windModeSwitchOpenBrace < 0
+                || functionSource[windModeSwitchOpenBrace] != '{'
+                ? -1
+                : FindMatchingDelimiter(
+                    functionSource,
+                    windModeSwitchOpenBrace,
+                    '{',
+                    '}'
+                );
+
+        if (
+            windModeSwitchOpenParen < 0
+            || windModeSwitchCloseParen < 0
+            || windModeSwitchOpenBrace < 0
+            || windModeSwitchCloseBrace < 0
+        )
+        {
+            diagnostic =
+                "reason=windMode-switch-delimiters-not-found";
+
+            return false;
+        }
+
         if (
             windDataStatement.EndExclusive
                 >= windModeSwitchIndex
@@ -4078,9 +8091,15 @@ internal static partial class StillGreenhousesRoomWindShaderPatch
             + indent
             + "vec4 stillGreenhousesRoomState = vec4(0.0);\n"
             + indent
-            + "bool stillGreenhousesRoomWind = "
+            + "int stillGreenhousesTargetFlag = "
+            + "windMode == 6 ? 2 : 1;\n"
+            + indent
+            + "bool stillGreenhousesRoomWind = (windMode != 0) &&\n"
+            + indent
+            + "    "
             + "stillGreenhousesResolveRoomWindState("
-            + "worldPos, 1, stillGreenhousesRoomState);\n"
+            + "worldPos, stillGreenhousesTargetFlag, "
+            + "stillGreenhousesRoomState);\n"
             + indent
             + "float stillGreenhousesWindSpeed = "
             + "stillGreenhousesRoomWind ? "
@@ -4088,11 +8107,13 @@ internal static partial class StillGreenhousesRoomWindShaderPatch
             + indent
             + "float stillGreenhousesWindWaveCounter = "
             + "stillGreenhousesRoomWind ? "
-            + "stillGreenhousesRoomState.y : windWaveCounter;\n"
+            + "stillGreenhousesRegularWindPhase("
+            + "stillGreenhousesRoomState) : windWaveCounter;\n"
             + indent
             + "float stillGreenhousesWindWaveCounterHighFreq = "
             + "stillGreenhousesRoomWind ? "
-            + "stillGreenhousesRoomState.z : windWaveCounterHighFreq;\n";
+            + "stillGreenhousesHighFrequencyWindPhase("
+            + "stillGreenhousesRoomState) : windWaveCounterHighFreq;\n";
 
         string rewrittenFunction =
             functionSource.Insert(
@@ -4103,6 +8124,112 @@ internal static partial class StillGreenhousesRoomWindShaderPatch
         int environmentEnd =
             windDataStatement.EndExclusive
             + environmentBlock.Length;
+
+        int modeCorrectionIndex =
+            windModeSwitchCloseBrace
+            + environmentBlock.Length
+            + 1;
+
+        const string vanillaModeSixDelta =
+            "worldPos.y += gnoise(noisepos) / 10;";
+
+        int modeSixDeltaIndex = rewrittenFunction.IndexOf(
+            vanillaModeSixDelta,
+            StringComparison.Ordinal
+        );
+
+        if (modeSixDeltaIndex < 0)
+        {
+            diagnostic = "reason=wind-mode-6-water-delta-not-found";
+            return false;
+        }
+
+        const string managedModeSixDelta =
+            "float stillGreenhousesModeSixAmplitude = "
+            + "stillGreenhousesRoomWind ? "
+            + "(stillGreenhousesRoomState.w < 0.0 ? 0.0 : "
+            + "0.75 + 0.9 * clamp(stillGreenhousesRoomState.x, 0.0, 2.0)) "
+            + ": 1.0;\n\t\t\tworldPos.y += "
+            + "stillGreenhousesModeSixAmplitude * gnoise(noisepos) / 10;";
+
+        rewrittenFunction = rewrittenFunction.Remove(
+            modeSixDeltaIndex,
+            vanillaModeSixDelta.Length
+        ).Insert(
+            modeSixDeltaIndex,
+            managedModeSixDelta
+        );
+
+        string switchIndent =
+            GetLineIndent(
+                functionSource,
+                windModeSwitchIndex
+            );
+
+        string modeCorrectionBlock =
+            "\n"
+            + switchIndent
+            + "// "
+            + ModeAwareCorrectionMarker
+            + "\n"
+            + switchIndent
+            + "if (stillGreenhousesRoomWind) {\n"
+            + switchIndent
+            + "    bool stillGreenhousesNoWind = "
+            + "stillGreenhousesRoomState.w < 0.0;\n"
+            + switchIndent
+            + "    float stillGreenhousesRoomAmplitude = "
+            + "clamp(stillGreenhousesWindSpeed, 0.0, 2.0);\n"
+            + switchIndent
+            + "    float stillGreenhousesSharedStrengthScale = "
+            + "(2.0 * stillGreenhousesRoomAmplitude) / "
+            + "max(0.0001, 1.0 + stillGreenhousesRoomAmplitude);\n"
+            + switchIndent
+            + "    if (stillGreenhousesNoWind) {\n"
+            + switchIndent
+            + "        strength = 0.0;\n"
+            + switchIndent
+            + "        heightBend = 0.0;\n"
+            + switchIndent
+            + "    } else if (windMode == 3 || windMode == 10) {\n"
+            + switchIndent
+            + "        strength *= stillGreenhousesSharedStrengthScale;\n"
+            + switchIndent
+            + "        heightBend *= stillGreenhousesRoomAmplitude;\n"
+            + switchIndent
+            + "    } else if (windMode == 8 || windMode == 9) {\n"
+            + switchIndent
+            + "        strength *= stillGreenhousesSharedStrengthScale;\n"
+            + switchIndent
+            + "    } else if (windMode == 4 || windMode == 5) {\n"
+            + switchIndent
+            + "        heightBend *= stillGreenhousesRoomAmplitude;\n"
+            + switchIndent
+            + "    } else if (windMode == 7) {\n"
+            + switchIndent
+            + "        strength *= stillGreenhousesRoomAmplitude;\n"
+            + switchIndent
+            + "        heightBend *= stillGreenhousesRoomAmplitude;\n"
+            + switchIndent
+            + "    } else if (windMode == 11) {\n"
+            + switchIndent
+            + "        strength *= (0.015 * stillGreenhousesRoomAmplitude) / "
+            + "max(0.0001, 0.013 + 0.002 * stillGreenhousesRoomAmplitude);\n"
+            + switchIndent
+            + "        heightBend *= stillGreenhousesRoomAmplitude;\n"
+            + switchIndent
+            + "    }\n"
+            + switchIndent
+            + "}\n";
+
+        // Insert mode-aware correction while source indices still correspond to
+        // the original Vanilla function. Identifier remapping below lengthens
+        // several tokens and would invalidate the switch-close index.
+        rewrittenFunction =
+            rewrittenFunction.Insert(
+                modeCorrectionIndex,
+                modeCorrectionBlock
+            );
 
         string functionPrefix =
             rewrittenFunction[..environmentEnd];
@@ -4167,6 +8294,10 @@ internal static partial class StillGreenhousesRoomWindShaderPatch
                 PatchMarker,
                 StringComparison.Ordinal
             )
+            || !rewrittenFunction.Contains(
+                ModeAwareCorrectionMarker,
+                StringComparison.Ordinal
+            )
             || actualWindSpeedReplacements
                 != windSpeedUses
             || actualWindWaveCounterReplacements
@@ -4196,101 +8327,8 @@ internal static partial class StillGreenhousesRoomWindShaderPatch
             return false;
         }
 
-        string uniformBlock =
-            "\n"
-            + "// "
-            + PatchMarker
-            + " uniforms\n"
-            + "uniform int "
-            + PositionCountUniformName
-            + ";\n"
-            + "uniform vec4 "
-            + PositionsUniformName
-            + "["
-            + StillGreenhousesRoomWindUniformRenderer
-                .MaxUploadedPositions
-            + "];\n"
-            + "uniform int "
-            + StateCountUniformName
-            + ";\n"
-            + "uniform vec4 "
-            + StatesUniformName
-            + "["
-            + StillGreenhousesRoomWindEnvironment
-                .RoomTypeStateCount
-            + "];\n"
-            + "uniform int "
-            + DebugVisualProofUniformName
-            + ";\n\n";
-
-        string helperBlock =
-            "\n"
-            + "// "
-            + PatchMarker
-            + " helpers\n"
-            + "bool stillGreenhousesResolveRoomWindState("
-            + "vec4 worldPos, int requiredTargetFlag, out vec4 roomState) {\n"
-            + "    roomState = vec4(0.0);\n"
-            + "    vec3 absolutePos = worldPos.xyz + playerpos;\n"
-            + "    bool found = false;\n"
-            + "    float bestDistanceSquared = 1e30;\n"
-            + "    for (int index = 0; "
-            + "index < stillGreenhousesRoomWindPositionCount; index++) {\n"
-            + "        vec4 entry = "
-            + "stillGreenhousesRoomWindPositions[index];\n"
-            + "        vec3 blockMin = entry.xyz - vec3(0.001);\n"
-            + "        vec3 blockMax = entry.xyz + vec3(1.001);\n"
-            + "        bool inside = all(greaterThanEqual("
-            + "absolutePos, blockMin)) && "
-            + "all(lessThanEqual(absolutePos, blockMax));\n"
-            + "        if (!inside) continue;\n"
-            + "        int packedTarget = int(entry.w + 0.5);\n"
-            + "        int stateIndex = packedTarget % "
-            + StillGreenhousesRoomWindEnvironment.RoomTypeStateCount
-            + ";\n"
-            + "        int targetFlags = packedTarget / "
-            + StillGreenhousesRoomWindEnvironment.RoomTypeStateCount
-            + ";\n"
-            + "        bool compatibleTarget = "
-            + "(targetFlags & requiredTargetFlag) != 0;\n"
-            + "        bool validState = stateIndex >= 0 && "
-            + "stateIndex < stillGreenhousesRoomWindStateCount;\n"
-            + "        if (!compatibleTarget || !validState) continue;\n"
-            + "        vec3 blockCenter = entry.xyz + vec3(0.5);\n"
-            + "        vec3 centerDelta = absolutePos - blockCenter;\n"
-            + "        float distanceSquared = dot(centerDelta, centerDelta);\n"
-            + "        if (!found || distanceSquared < bestDistanceSquared) {\n"
-            + "            roomState = "
-            + "stillGreenhousesRoomWindStates[stateIndex];\n"
-            + "            bestDistanceSquared = distanceSquared;\n"
-            + "            found = true;\n"
-            + "        }\n"
-            + "    }\n"
-            + "    return found;\n"
-            + "}\n\n"
-            + "vec4 "
-            + CallSiteWrapperFunctionName
-            + "(int renderFlags, vec4 basePos, vec4 warpedPos) {\n"
-            + "    if ((renderFlags & WindModeBitMask) <= 0) "
-            + "return warpedPos;\n"
-            + "    int windMode = "
-            + "(renderFlags >> WindModePosition) & 0xF;\n"
-            + "    if (windMode == 6 || windMode == 12) "
-            + "return warpedPos;\n"
-            + "    vec4 roomState = vec4(0.0);\n"
-            + "    if (!stillGreenhousesResolveRoomWindState("
-            + "basePos, 1, roomState)) return warpedPos;\n"
-            + "    float roomAmplitude = clamp(roomState.x, 0.0, 2.0);\n"
-            + "    vec4 result = warpedPos;\n"
-            + "    result.xyz = basePos.xyz + "
-            + "(warpedPos.xyz - basePos.xyz) * roomAmplitude;\n"
-            + "    if ("
-            + DebugVisualProofUniformName
-            + " != 0) {\n"
-            + "        result.x += 0.35 * sin(roomState.y * 4.0);\n"
-            + "    }\n"
-            + "    return result;\n"
-            + "}\n\n";
+        string uniformBlock = BuildCellHashUniformBlock();
+        string helperBlock = BuildCellHashHelperBlock();
 
         patchedWindSpeedUses =
             actualWindSpeedReplacements;
@@ -4320,14 +8358,225 @@ internal static partial class StillGreenhousesRoomWindShaderPatch
 
         diagnostic =
             "reason=<none>; "
-            + "strategy=vanilla-warp-room-state-plus-delta-scale; "
-            + "absolutePosition=worldPos+playerpos";
+            + "strategy=vanilla-native-warp-with-room-environmental-inputs; "
+            + "positionMatch=bounded-quarter-block-texture-hash";
 
         capturedFunctionSource =
             rewrittenFunction;
 
         return true;
     }
+
+    private static string BuildCellHashUniformBlock() => $$"""
+
+// {{PatchMarker}} uniforms
+uniform int {{PositionCountUniformName}};
+uniform sampler2D {{CellHashTextureUniformName}};
+uniform int {{CellHashCapacityUniformName}};
+uniform int {{CellHashMaskUniformName}};
+uniform int {{CellHashSeedUniformName}};
+uniform int {{CellHashTextureWidthUniformName}};
+uniform int {{CellHashOriginXUniformName}};
+uniform int {{CellHashOriginYUniformName}};
+uniform int {{CellHashOriginZUniformName}};
+uniform int {{RenderReferenceQuarterXUniformName}};
+uniform int {{RenderReferenceQuarterYUniformName}};
+uniform int {{RenderReferenceQuarterZUniformName}};
+uniform float {{RenderReferenceFractionXUniformName}};
+uniform float {{RenderReferenceFractionYUniformName}};
+uniform float {{RenderReferenceFractionZUniformName}};
+uniform int {{StateCountUniformName}};
+uniform vec4 {{StatesUniformName}}[{{StillGreenhousesRoomWindUniformRenderer.UploadedShaderStateVectorCount}}];
+uniform int {{DebugVisualProofUniformName}};
+bool stillGreenhousesResolveRoomWindState(vec4 worldPos, int requiredTargetFlag, out vec4 roomState);
+float stillGreenhousesRegularWindPhase(vec4 roomState);
+float stillGreenhousesHighFrequencyWindPhase(vec4 roomState);
+
+""";
+
+    private static string BuildCellHashHelperBlock() => $$"""
+
+// {{PatchMarker}} helpers
+{{RoomWindCellHash.GlslHashSource}}
+
+int stillGreenhousesDecodeSigned16(uint lowByte, uint highByte)
+{
+    int value = int(lowByte | (highByte << 8u));
+    return value >= 32768 ? value - 65536 : value;
+}
+
+ivec2 stillGreenhousesCellHashTexelCoordinate(int linearTexel)
+{
+    return ivec2(
+        linearTexel % {{CellHashTextureWidthUniformName}},
+        linearTexel / {{CellHashTextureWidthUniformName}}
+    );
+}
+
+bool stillGreenhousesResolveRoomWindState(
+    vec4 worldPos,
+    int requiredTargetFlag,
+    out vec4 roomState
+)
+{
+    roomState = vec4(0.0);
+
+    if (
+        {{PositionCountUniformName}} <= 0
+        || {{CellHashCapacityUniformName}} <= 0
+        || {{CellHashTextureWidthUniformName}} <= 0
+    ) return false;
+
+    vec3 renderRelativeQuarter =
+        (worldPos.xyz + playerpos) * 4.0
+        + vec3(
+            {{RenderReferenceFractionXUniformName}},
+            {{RenderReferenceFractionYUniformName}},
+            {{RenderReferenceFractionZUniformName}}
+        );
+
+        // Liquid vertices frequently lie exactly on block and quarter-cell
+        // boundaries. A small positive bias prevents floating-point reconstruction
+        // from intermittently flooring them into the neighboring lower cell when
+        // the render reference changes.
+        if (requiredTargetFlag == 2)
+        {
+            const float liquidCellBoundaryBias = 0.01;
+            renderRelativeQuarter += vec3(liquidCellBoundaryBias);
+        }
+
+ivec3 absoluteCell =
+    ivec3(floor(renderRelativeQuarter))
+    + ivec3(
+        stillGreenhousesRenderReferenceQuarterX,
+        stillGreenhousesRenderReferenceQuarterY,
+        stillGreenhousesRenderReferenceQuarterZ
+    );
+
+    ivec3 absoluteCell = ivec3(floor(renderRelativeQuarter))
+        + ivec3(
+            {{RenderReferenceQuarterXUniformName}},
+            {{RenderReferenceQuarterYUniformName}},
+            {{RenderReferenceQuarterZUniformName}}
+        );
+
+    ivec3 relativeCell = absoluteCell
+        - ivec3(
+            {{CellHashOriginXUniformName}},
+            {{CellHashOriginYUniformName}},
+            {{CellHashOriginZUniformName}}
+        );
+
+    if (
+        any(lessThan(relativeCell, ivec3(-32768)))
+        || any(greaterThan(relativeCell, ivec3(32767)))
+    ) return false;
+
+    uint hash = stillGreenhousesHashRelativeCell(
+        relativeCell,
+        uint({{CellHashSeedUniformName}})
+    );
+
+    for (int probe = 0; probe < {{RoomWindCellHash.ProbeLimit}}; probe++)
+    {
+        int slot = int(
+            (hash + uint(probe))
+            & uint({{CellHashMaskUniformName}})
+        );
+        int linearTexel = slot * {{RoomWindCellHash.TexelsPerSlot}};
+        uvec4 keyBytes = uvec4(round(
+            texelFetch(
+                {{CellHashTextureUniformName}},
+                stillGreenhousesCellHashTexelCoordinate(linearTexel),
+                0
+            ) * 255.0
+        ));
+        uvec4 valueBytes = uvec4(round(
+            texelFetch(
+                {{CellHashTextureUniformName}},
+                stillGreenhousesCellHashTexelCoordinate(linearTexel + 1),
+                0
+            ) * 255.0
+        ));
+
+        if (valueBytes.a == 0u) return false;
+
+        ivec3 storedCell = ivec3(
+            stillGreenhousesDecodeSigned16(keyBytes.r, keyBytes.g),
+            stillGreenhousesDecodeSigned16(keyBytes.b, keyBytes.a),
+            stillGreenhousesDecodeSigned16(valueBytes.r, valueBytes.g)
+        );
+
+        if (any(notEqual(storedCell, relativeCell))) continue;
+
+        int payload = int(valueBytes.b);
+        int targetCode = requiredTargetFlag == 2
+            ? (payload >> 2) & 3
+            : payload & 3;
+
+        if (targetCode == 0) return false;
+
+        int stateIndex = targetCode - 1;
+        if (requiredTargetFlag == 2) stateIndex += 3;
+
+        if (
+            stateIndex < 0
+            || stateIndex >= {{StateCountUniformName}}
+        ) return false;
+
+        roomState = {{StatesUniformName}}[stateIndex];
+        return true;
+    }
+
+    return false;
+}
+
+float stillGreenhousesRegularWindPhase(vec4 roomState)
+{
+    float speed = clamp(roomState.x, 0.0, 2.0);
+    return mod(roomState.y + timeCounter * (0.5 + 2.0 * speed), 6000.0);
+}
+
+float stillGreenhousesHighFrequencyWindPhase(vec4 roomState)
+{
+    float speed = clamp(roomState.x, 0.0, 2.0);
+    float rate = (0.4 + speed / 10.0) * (0.5 + 5.0 * speed);
+    return mod(roomState.z + timeCounter * rate, 6000.0);
+}
+
+vec4 {{CallSiteWrapperFunctionName}}(
+    int renderFlags,
+    vec4 basePos,
+    vec4 warpedPos
+)
+{
+    if ((renderFlags & WindModeBitMask) <= 0) return warpedPos;
+
+    if ({{DebugVisualProofUniformName}} == 2)
+    {
+        vec4 callSiteProof = warpedPos;
+        callSiteProof.x += 0.75;
+        return callSiteProof;
+    }
+
+    int windMode = (renderFlags >> WindModePosition) & 0xF;
+    if (windMode == 6 || windMode == 12) return warpedPos;
+
+    if ({{DebugVisualProofUniformName}} == 1)
+    {
+        vec4 roomState = vec4(0.0);
+        if (stillGreenhousesResolveRoomWindState(basePos, 1, roomState))
+        {
+            vec4 managedPositionProof = warpedPos;
+            managedPositionProof.y += 0.35;
+            return managedPositionProof;
+        }
+    }
+
+    return warpedPos;
+}
+
+""";
 
     private static bool TryPatchLiquidWarping(
         string source,
@@ -4404,7 +8653,7 @@ internal static partial class StillGreenhousesRoomWindShaderPatch
 
         diagnostic =
             "reason=<none>; "
-            + "strategy=room-type-liquid-amplitude";
+            + "strategy=room-local-vanilla-liquid-environment";
 
         return true;
     }
@@ -4540,40 +8789,86 @@ internal static partial class StillGreenhousesRoomWindShaderPatch
 
     // Liquid keeps Vanilla's two-noise deformation shape. Managed room water
     // uses the room-local wind counter for the wind-affected phase, then scales
-    // the complete Vanilla liquid-warp delta by the room wind scalar. This
-    // mirrors the vegetation wrapper's room-owned amplitude semantics.
-    private static string BuildPatchedLiquidFunction() =>
+    // the complete Vanilla liquid-warp delta by the room wind scalar. Liquid
+    // remains a separate optional behavior; vegetation now relies only on
+    // Vanilla's native warp evaluated with room-local environmental inputs.
+    private static string BuildPatchedLiquidFunction() => $$"""
+vec4 applyLiquidWarping(bool windAffected, vec4 worldPos, float div) {
+	#if WAVINGSTUFF == 1
+	// {{LiquidPatchMarker}}
+	vec4 stillGreenhousesLiquidRoomState = vec4(0.0);
+	bool stillGreenhousesRoomLiquid = windAffected
+		&& stillGreenhousesResolveRoomWindState(
+			worldPos,
+			2,
+			stillGreenhousesLiquidRoomState
+		);
+	bool stillGreenhousesLiquidNoWind = stillGreenhousesRoomLiquid
+		&& stillGreenhousesLiquidRoomState.w < 0.0;
+	float stillGreenhousesLiquidWindSpeed = stillGreenhousesRoomLiquid
+		? clamp(stillGreenhousesLiquidRoomState.x, 0.0, 2.0)
+		: windSpeed;
+	float stillGreenhousesLiquidWindWaveCounter = stillGreenhousesRoomLiquid
+		? stillGreenhousesRegularWindPhase(stillGreenhousesLiquidRoomState)
+		: windWaveCounter;
+	float stillGreenhousesLiquidWaterWaveIntensity = stillGreenhousesRoomLiquid
+		? (stillGreenhousesLiquidNoWind
+			? 0.0
+			: 0.75 + 0.9 * stillGreenhousesLiquidWindSpeed)
+		: waterWaveIntensity;
+	float stillGreenhousesLiquidSecondaryIntensity = stillGreenhousesLiquidNoWind
+		? 0.0
+		: windWaveIntensity;
+
+	vec3 noisepos = vec3(
+		(worldPos.x + playerpos.x) / 3,
+		(worldPos.z + playerpos.z) / 3,
+		waterWaveCounter / 8
+			+ (windAffected ? stillGreenhousesLiquidWindWaveCounter / 4 : 0)
+	);
+	worldPos.y += stillGreenhousesLiquidWaterWaveIntensity
+		* gnoise(noisepos) / div;
+
+	if (windAffected) worldPos.y += stillGreenhousesLiquidSecondaryIntensity
+		* gnoise(noisepos * 3.5) / (div * 4);
+
+	worldPos.xyz = applyPerceptionWarping(worldPos.xyz);
+	#endif
+
+	return worldPos;
+}
+""";
+
+    // Kept in-source for the 0.18.0 rollback window. It is no longer emitted;
+    // it used the shared linear descriptor list and scaled the final delta.
+    private static string BuildPatchedLiquidFunctionLegacy() =>
         "vec4 applyLiquidWarping(bool windAffected, vec4 worldPos, float div) {\n"
         + "\t#if WAVINGSTUFF == 1\n"
         + "\t// " + LiquidPatchMarker + "\n"
         + "\tvec4 stillGreenhousesLiquidBasePos = worldPos;\n"
         + "\tbool stillGreenhousesRoomLiquid = false;\n"
         + "\tvec4 stillGreenhousesLiquidRoomState = vec4(0.0);\n"
-        + "\tvec3 stillGreenhousesLiquidAbsPos = worldPos.xyz + playerpos;\n"
+        + "\tvec3 stillGreenhousesLiquidRelativePos = "
+        + "worldPos.xyz + playerpos;\n"
         + "\tfloat stillGreenhousesLiquidBestDistanceSquared = 1e30;\n"
         + "\tfor (int stillGreenhousesLiquidIndex = 0; "
         + "stillGreenhousesLiquidIndex < stillGreenhousesRoomWindPositionCount; "
         + "stillGreenhousesLiquidIndex++) {\n"
         + "\t\tvec4 stillGreenhousesLiquidEntry = "
         + "stillGreenhousesRoomWindPositions[stillGreenhousesLiquidIndex];\n"
-        + "\t\tvec3 stillGreenhousesLiquidMin = "
-        + "stillGreenhousesLiquidEntry.xyz - vec3(0.001);\n"
-        + "\t\tvec3 stillGreenhousesLiquidMax = "
-        + "stillGreenhousesLiquidEntry.xyz + vec3(1.001);\n"
-        + "\t\tbool stillGreenhousesLiquidInside = "
-        + "all(greaterThanEqual(stillGreenhousesLiquidAbsPos, "
-        + "stillGreenhousesLiquidMin)) && "
-        + "all(lessThanEqual(stillGreenhousesLiquidAbsPos, "
-        + "stillGreenhousesLiquidMax));\n"
-        + "\t\tif (!stillGreenhousesLiquidInside) continue;\n"
-        + "\t\tint stillGreenhousesLiquidPackedTarget = "
+        + "\t\tint stillGreenhousesLiquidPackedMetadata = "
         + "int(stillGreenhousesLiquidEntry.w + 0.5);\n"
+        + "\t\tint stillGreenhousesLiquidPackedTarget = "
+        + "stillGreenhousesLiquidPackedMetadata & 15;\n"
         + "\t\tint stillGreenhousesLiquidStateIndex = "
         + "stillGreenhousesLiquidPackedTarget % "
         + StillGreenhousesRoomWindEnvironment.RoomTypeStateCount
         + ";\n"
         + "\t\tint stillGreenhousesLiquidTargetFlags = "
         + "stillGreenhousesLiquidPackedTarget / "
+        + StillGreenhousesRoomWindEnvironment.RoomTypeStateCount
+        + ";\n"
+        + "\t\tstillGreenhousesLiquidStateIndex += "
         + StillGreenhousesRoomWindEnvironment.RoomTypeStateCount
         + ";\n"
         + "\t\tbool stillGreenhousesWaterTarget = "
@@ -4584,10 +8879,32 @@ internal static partial class StillGreenhousesRoomWindShaderPatch
         + "stillGreenhousesRoomWindStateCount;\n"
         + "\t\tif (!stillGreenhousesWaterTarget || "
         + "!stillGreenhousesLiquidValidState) continue;\n"
+        + "\t\tint stillGreenhousesLiquidExtentX = "
+        + "(stillGreenhousesLiquidPackedMetadata >> 4) & 63;\n"
+        + "\t\tint stillGreenhousesLiquidExtentY = "
+        + "(stillGreenhousesLiquidPackedMetadata >> 10) & 63;\n"
+        + "\t\tint stillGreenhousesLiquidExtentZ = "
+        + "(stillGreenhousesLiquidPackedMetadata >> 16) & 63;\n"
+        + "\t\tvec3 stillGreenhousesLiquidHalfExtents = "
+        + "vec3(float(stillGreenhousesLiquidExtentX), "
+        + "float(stillGreenhousesLiquidExtentY), "
+        + "float(stillGreenhousesLiquidExtentZ)) * 0.125;\n"
+        + "\t\tvec3 stillGreenhousesLiquidMin = "
+        + "stillGreenhousesLiquidEntry.xyz - "
+        + "stillGreenhousesLiquidHalfExtents;\n"
+        + "\t\tvec3 stillGreenhousesLiquidMax = "
+        + "stillGreenhousesLiquidEntry.xyz + "
+        + "stillGreenhousesLiquidHalfExtents;\n"
+        + "\t\tbool stillGreenhousesLiquidInside = "
+        + "all(greaterThanEqual(stillGreenhousesLiquidRelativePos, "
+        + "stillGreenhousesLiquidMin)) && "
+        + "all(lessThanEqual(stillGreenhousesLiquidRelativePos, "
+        + "stillGreenhousesLiquidMax));\n"
+        + "\t\tif (!stillGreenhousesLiquidInside) continue;\n"
         + "\t\tvec3 stillGreenhousesLiquidCenter = "
-        + "stillGreenhousesLiquidEntry.xyz + vec3(0.5);\n"
+        + "stillGreenhousesLiquidEntry.xyz;\n"
         + "\t\tvec3 stillGreenhousesLiquidCenterDelta = "
-        + "stillGreenhousesLiquidAbsPos - stillGreenhousesLiquidCenter;\n"
+        + "stillGreenhousesLiquidRelativePos - stillGreenhousesLiquidCenter;\n"
         + "\t\tfloat stillGreenhousesLiquidDistanceSquared = "
         + "dot(stillGreenhousesLiquidCenterDelta, "
         + "stillGreenhousesLiquidCenterDelta);\n"

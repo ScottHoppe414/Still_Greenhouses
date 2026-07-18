@@ -1,5 +1,5 @@
 /*
-version 0.10.16a
+version 0.18.0
 */
 
 using Vintagestory.API.Common;
@@ -50,9 +50,10 @@ internal static partial class StillGreenhousesShared
         return config;
     }
 
-    // Broad structural identity used by wind eligibility and room interior
-    // pass-through logic. A block only becomes a room-wind target after its
-    // rendered mesh is also proven to contain a nonzero Vanilla WindMode.
+    // Broad structural identity used by normal world-vegetation eligibility and
+    // room interior pass-through logic. The generic ApplyToOtherVegetation
+    // fallback may additionally accept a non-identity rendered mesh, but only
+    // after that mesh is proven to contain a nonzero Vanilla WindMode.
     internal static bool IsVegetationIdentityBlock(
         Block? block
     )
@@ -749,14 +750,19 @@ internal static partial class StillGreenhousesShared
                 .ToArray()
         );
 
-        // Any legacy nonzero movement-mode name migrates to VanillaLowWind. Only an
-        // explicit NoWind selection produces fully stationary vegetation.
+        // Legacy NoWind becomes the shader-driven VanillaNoWind mode. Any
+        // legacy nonzero movement-mode name migrates to VanillaLowWind.
         return string.Equals(
-                normalizedMode,
-                nameof(RoomPlantMovementMode.NoWind),
-                StringComparison.OrdinalIgnoreCase
-            )
-            ? RoomPlantMovementMode.NoWind
+                   normalizedMode,
+                   nameof(RoomPlantMovementMode.VanillaNoWind),
+                   StringComparison.OrdinalIgnoreCase
+               )
+               || string.Equals(
+                   normalizedMode,
+                   "NoWind",
+                   StringComparison.OrdinalIgnoreCase
+               )
+            ? RoomPlantMovementMode.VanillaNoWind
             : RoomPlantMovementMode.VanillaLowWind;
     }
 
@@ -851,16 +857,72 @@ internal static partial class StillGreenhousesShared
         config.RoomWindUpperPercent =
             roomUpper;
 
+        NormalizeWindRange(
+            config.GreenhouseWaterWindLowerPercent,
+            config.GreenhouseWaterWindUpperPercent,
+            out float greenhouseWaterLower,
+            out float greenhouseWaterUpper
+        );
+
+        config.GreenhouseWaterWindLowerPercent =
+            greenhouseWaterLower;
+
+        config.GreenhouseWaterWindUpperPercent =
+            greenhouseWaterUpper;
+
+        NormalizeWindRange(
+            config.CellarWaterWindLowerPercent,
+            config.CellarWaterWindUpperPercent,
+            out float cellarWaterLower,
+            out float cellarWaterUpper
+        );
+
+        config.CellarWaterWindLowerPercent =
+            cellarWaterLower;
+
+        config.CellarWaterWindUpperPercent =
+            cellarWaterUpper;
+
+        NormalizeWindRange(
+            config.RoomWaterWindLowerPercent,
+            config.RoomWaterWindUpperPercent,
+            out float roomWaterLower,
+            out float roomWaterUpper
+        );
+
+        config.RoomWaterWindLowerPercent =
+            roomWaterLower;
+
+        config.RoomWaterWindUpperPercent =
+            roomWaterUpper;
+
         config.MinimumManagedRoomInteriorPositions = Math.Clamp(
             config.MinimumManagedRoomInteriorPositions,
             1,
             32768
         );
 
+        int maximumAffectedPlantPositions =
+            config.ExperimentalExtendedPositionCapacity
+                ? StillGreenhousesConfig.MaximumAffectedPlantPositions
+                : StillGreenhousesConfig.StandardMaximumAffectedPlantPositions;
+
+        config.MaxAffectedPlants = Math.Clamp(
+            config.MaxAffectedPlants,
+            StillGreenhousesConfig.MinimumAffectedPlantPositions,
+            maximumAffectedPlantPositions
+        );
+
         config.MaxServerChunkScansPerTick = Math.Clamp(
             config.MaxServerChunkScansPerTick,
             1,
             8
+        );
+
+        config.ServerForegroundWorkBudgetMs = Math.Clamp(
+            config.ServerForegroundWorkBudgetMs,
+            0.5f,
+            20f
         );
 
         config.ServerRescanDelayMs = Math.Clamp(
@@ -923,10 +985,34 @@ internal static partial class StillGreenhousesShared
             64
         );
 
+        config.ClientForegroundWorkIntervalMs = Math.Clamp(
+            config.ClientForegroundWorkIntervalMs,
+            20,
+            1000
+        );
+
+        config.MaxClientWaterChecksPerTick = Math.Clamp(
+            config.MaxClientWaterChecksPerTick,
+            16,
+            4096
+        );
+
+        config.MaxClientChunkRedrawsPerTick = Math.Clamp(
+            config.MaxClientChunkRedrawsPerTick,
+            1,
+            16
+        );
+
         config.ClientCachePruneIntervalMs = Math.Clamp(
             config.ClientCachePruneIntervalMs,
             5000,
             120000
+        );
+
+        config.RoomInspectionFailureRadius = Math.Clamp(
+            config.RoomInspectionFailureRadius,
+            4,
+            24
         );
     }
 
@@ -1086,7 +1172,7 @@ internal enum ManagedRoomType
 
 internal enum RoomPlantMovementMode
 {
-    NoWind = 0,
+    VanillaNoWind = 0,
     VanillaLowWind = 1
 }
 
@@ -1274,6 +1360,111 @@ internal sealed class GreenhouseRegion
                 Z1 + dz,
                 Dimension
             );
+        }
+    }
+
+    internal bool IntersectsChunk(
+        ChunkKey chunkKey
+    )
+    {
+        if (chunkKey.Dimension != Dimension)
+        {
+            return false;
+        }
+
+        int chunkSize =
+            StillGreenhousesShared.ChunkSize;
+
+        int chunkX1 = chunkKey.X * chunkSize;
+        int chunkY1 = chunkKey.Y * chunkSize;
+        int chunkZ1 = chunkKey.Z * chunkSize;
+
+        int chunkX2 = chunkX1 + chunkSize - 1;
+        int chunkY2 = chunkY1 + chunkSize - 1;
+        int chunkZ2 = chunkZ1 + chunkSize - 1;
+
+        return X1 <= chunkX2
+               && X2 >= chunkX1
+               && Y1 <= chunkY2
+               && Y2 >= chunkY1
+               && Z1 <= chunkZ2
+               && Z2 >= chunkZ1;
+    }
+
+    internal IEnumerable<BlockPos> GetOccupiedPositionsInChunk(
+        ChunkKey chunkKey
+    )
+    {
+        if (!IntersectsChunk(chunkKey))
+        {
+            yield break;
+        }
+
+        int chunkSize =
+            StillGreenhousesShared.ChunkSize;
+
+        int chunkX1 = chunkKey.X * chunkSize;
+        int chunkY1 = chunkKey.Y * chunkSize;
+        int chunkZ1 = chunkKey.Z * chunkSize;
+
+        int minX = Math.Max(X1, chunkX1);
+        int minY = Math.Max(Y1, chunkY1);
+        int minZ = Math.Max(Z1, chunkZ1);
+
+        int maxX = Math.Min(
+            X2,
+            chunkX1 + chunkSize - 1
+        );
+
+        int maxY = Math.Min(
+            Y2,
+            chunkY1 + chunkSize - 1
+        );
+
+        int maxZ = Math.Min(
+            Z2,
+            chunkZ1 + chunkSize - 1
+        );
+
+        int sizeX = X2 - X1 + 1;
+        int sizeZ = Z2 - Z1 + 1;
+
+        for (int y = minY; y <= maxY; y++)
+        {
+            int dy = y - Y1;
+
+            for (int z = minZ; z <= maxZ; z++)
+            {
+                int dz = z - Z1;
+                int rowStart =
+                    (dy * sizeZ + dz) * sizeX;
+
+                for (int x = minX; x <= maxX; x++)
+                {
+                    int index =
+                        rowStart + x - X1;
+
+                    int byteIndex = index / 8;
+
+                    if (
+                        byteIndex >= posInRoom.Length
+                        || (
+                            posInRoom[byteIndex]
+                            & (1 << (index % 8))
+                        ) == 0
+                    )
+                    {
+                        continue;
+                    }
+
+                    yield return new BlockPos(
+                        x,
+                        y,
+                        z,
+                        Dimension
+                    );
+                }
+            }
         }
     }
 

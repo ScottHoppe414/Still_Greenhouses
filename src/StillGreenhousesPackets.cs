@@ -1,5 +1,5 @@
 /*
-version 0.10.16a
+version 0.18.0
 */
 
 using ProtoBuf;
@@ -8,7 +8,7 @@ namespace StillGreenhouses;
 
 internal static class StillGreenhousesNetwork
 {
-    internal const string ChannelName = "stillgreenhouses-cache-v4";
+    internal const string ChannelName = "stillgreenhouses-cache-v5";
 }
 
 [ProtoContract]
@@ -25,6 +25,7 @@ internal sealed class GreenhouseChunkRequest
 
     [ProtoMember(4)]
     public int Dimension;
+
 }
 
 [ProtoContract]
@@ -100,4 +101,66 @@ internal sealed class GreenhouseRegionPacket
 
     [ProtoMember(10)]
     public int RoomType;
+}
+
+internal enum RoomInspectionResultKind
+{
+    DisabledByServer = 0,
+    NoVanillaRoom = 1,
+    Incomplete = 2,
+    VanillaRoomOnly = 3,
+    ManagedRoom = 4
+}
+
+internal enum RoomInspectionFailureReason
+{
+    None = 0,
+    VanillaInvalid = 1,
+    TooSmall = 2,
+    NoDiscoveryAnchor = 3,
+    ChunkDataIncomplete = 4,
+    DisabledByServer = 5
+}
+
+[ProtoContract]
+internal sealed class RoomInspectionRequest
+{
+    [ProtoMember(1)]
+    public long RequestId;
+}
+
+[ProtoContract]
+internal sealed class RoomInspectionResponse
+{
+    [ProtoMember(1)]
+    public long RequestId;
+
+    [ProtoMember(2)]
+    public int ResultKind;
+
+    [ProtoMember(3)]
+    public int FailureReason;
+
+    [ProtoMember(4)]
+    public int RoomType;
+
+    [ProtoMember(5)]
+    public int CenterX;
+
+    [ProtoMember(6)]
+    public int CenterY;
+
+    [ProtoMember(7)]
+    public int CenterZ;
+
+    [ProtoMember(8)]
+    public int Dimension;
+
+    [ProtoMember(9)]
+    public int FailureRadius;
+
+    // Present for any complete room that passes Vanilla classification,
+    // including rooms that fail Still Greenhouses viability.
+    [ProtoMember(10)]
+    public GreenhouseRegionPacket? Region;
 }

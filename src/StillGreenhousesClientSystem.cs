@@ -1,10 +1,11 @@
 /*
-version 0.10.16a
+version 0.18.0
 */
 
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading.Channels;
 using HarmonyLib;
@@ -19,6 +20,12 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
     private const string HarmonyId = "stillgreenhouses.patches";
     private const string ConfigLibSavedEvent =
         "configlib:stillgreenhouses:config-saved";
+
+    // Background workers explicitly yield between main-thread handoffs. Debug
+    // logging previously supplied this pacing accidentally, so release builds
+    // could enqueue work in a different order than diagnostic builds.
+    private const int WorkerHandoffDelayMs = 16;
+    private const int BusyPipelineRetryDelayMs = 10;
 
     internal static ICoreClientAPI? Capi { get; private set; }
     internal static StillGreenhousesConfig? Config { get; private set; }
@@ -56,10 +63,6 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
     internal static bool RoomWindEnvironmentActive =>
         StillGreenhousesRoomWindEnvironment
             .EnvironmentActive;
-
-    internal static string EffectiveGreenhouseWindTarget =>
-        StillGreenhousesRoomWindEnvironment
-            .EffectiveWindTarget;
 
     internal static void DebugLiteral(string message)
     {
@@ -104,7 +107,7 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
 
     private static readonly ConcurrentDictionary<
         ChunkKey,
-        byte
+        long
     > PendingChunkRequests = new();
 
     private static readonly ConcurrentDictionary<
@@ -138,14 +141,54 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
     > KnownWindAdjustments = new();
 
     private static readonly ConcurrentDictionary<
+        FlowerMeshProcessLogKey,
+        byte
+    > KnownFlowerMeshProcesses = new();
+
+    private static readonly ConcurrentDictionary<
         string,
         byte
     > KnownUnclassifiedWindBlocks = new();
 
+    private static readonly ConcurrentDictionary<
+        ContainerWindTargetLogKey,
+        byte
+    > KnownContainerWindTargets = new();
+
+    private static readonly ConcurrentDictionary<
+        string,
+        byte
+    > KnownWindMeshFallbackTargets = new();
+
+    private static readonly ConcurrentQueue<
+        PendingWaterScanBatch
+    > PendingWaterScanBatches = new();
+
+    private static readonly ConcurrentDictionary<
+        ChunkKey,
+        long
+    > LatestQueuedWaterScanRevision = new();
+
+    private static readonly ConcurrentQueue<
+        ChunkKey
+    > PendingChunkRedrawQueue = new();
+
+    private static readonly ConcurrentDictionary<
+        ChunkKey,
+        string
+    > PendingChunkRedraws = new();
+
     private static long playerChunkTickListenerId;
+    private static long foregroundWorkTickListenerId;
     private static long cachePruneListenerId;
     private static long debugSummaryListenerId;
     private static int suppressBlockChanged;
+
+    private static long waterScanPositionsChecked;
+    private static long waterScanPositionsRegistered;
+    private static long waterScanBatchesDropped;
+    private static long chunkRedrawRequestsQueued;
+    private static long chunkRedrawsProcessed;
 
     private static CancellationTokenSource? workerCancellation;
     private static Task? discoveryWorkerTask;
@@ -158,7 +201,9 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
         latestPlayerChunkSnapshot;
 
     private static int clientWorldGeneration;
-    private static int snapshotPacketsQueued;
+    private static int snapshotPipelineInFlight;
+    private static int requestBatchHandoffInFlight;
+    private static long nextPendingRequestLeaseId;
 
     private Harmony? harmony;
     private ICoreClientAPI? lifecycleClientApi;
@@ -173,12 +218,22 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
         api.Network
             .RegisterChannel(StillGreenhousesNetwork.ChannelName)
             .RegisterMessageType<GreenhouseChunkBatchRequest>()
-            .RegisterMessageType<GreenhouseChunkSnapshot>();
+            .RegisterMessageType<GreenhouseChunkSnapshot>()
+            .RegisterMessageType<RoomInspectionRequest>()
+            .RegisterMessageType<RoomInspectionResponse>();
 
         if (api is ICoreClientAPI clientApi)
         {
             lifecycleClientApi =
                 clientApi;
+
+            // Shader array capacity is a restart-only config choice, so load
+            // it before the generated shader origin is prepared during the
+            // early asset lifecycle.
+            Config = StillGreenhousesShared.LoadConfig(
+                clientApi,
+                storeNormalizedConfig: false
+            );
 
             // Generate and register the game-domain shader origin before normal
             // asset loading resolves shader includes. The source is structurally
@@ -231,8 +286,14 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
             return;
         }
 
+        // The override origin was registered before normal asset loading and
+        // the resolved shader assets already match the prepared source set.
+        // Do not globally reload every engine shader here. In a modded client,
+        // ReloadShaders() can rebuild animated programs without their native
+        // Animation UBO metadata and cause a crash when AnimatableRenderer
+        // accesses prog.UBOs["Animation"].
         StillGreenhousesRoomWindShaderPatch
-            .ReloadCompiledShaders(
+            .FinalizePreparedShaderLifecycle(
                 api,
                 "BlockTexturesLoaded"
             );
@@ -244,7 +305,7 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
     {
         Capi = api;
 
-        Config = StillGreenhousesShared.LoadConfig(
+        Config ??= StillGreenhousesShared.LoadConfig(
             api,
             storeNormalizedConfig: false
         );
@@ -254,6 +315,9 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
                 .GetChannel(StillGreenhousesNetwork.ChannelName)
                 .SetMessageHandler<GreenhouseChunkSnapshot>(
                     OnChunkSnapshot
+                )
+                .SetMessageHandler<RoomInspectionResponse>(
+                    OnRoomInspectionResponse
                 );
 
         harmony = new Harmony(HarmonyId);
@@ -266,7 +330,8 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
 
             api.Logger.Notification(
                 "[StillGreenhouses] Client Harmony patches applied: " +
-                "unified vegetation policy plus dedicated tall-plant and fruiting-bush mesh paths."
+                "unified vegetation policy, tall-plant/fruiting-bush paths, " +
+                "and generic contained wind-mesh capture."
             );
         }
         catch (Exception e)
@@ -280,12 +345,16 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
         }
 
         api.Event.LeaveWorld += OnLeaveWorld;
+        api.Event.LevelFinalize += OnLevelFinalize;
         api.Event.BlockChanged += OnBlockChanged;
 
+        // Room inspection is initialized after LevelFinalize instead of
+        // during StartClientSide. Applying block highlights while the world
+        // and animated renderers are still being initialized can expose
+        // partially constructed engine shader programs.
+
         roomWindUniformRenderer =
-            new StillGreenhousesRoomWindUniformRenderer(
-                api
-            );
+            new StillGreenhousesRoomWindUniformRenderer(api);
 
         api.Event.RegisterRenderer(
             roomWindUniformRenderer,
@@ -301,6 +370,12 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
             api.Event.RegisterGameTickListener(
                 UpdatePlayerChunkSnapshot,
                 250
+            );
+
+        foregroundWorkTickListenerId =
+            api.Event.RegisterGameTickListener(
+                ProcessClientForegroundWork,
+                Config.ClientForegroundWorkIntervalMs
             );
 
         StartClientWorkers(api);
@@ -323,11 +398,13 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
         );
 
         api.Logger.Notification(
-            $"[StillGreenhouses] Client loaded v0.10.16a. " +
+                $"[StillGreenhouses] Client loaded v0.18.0. " +
             $"Enabled={Config.Enabled}, " +
             $"ClientVisualEnabled={Config.ClientVisualEnabled}, " +
+            $"ShowRoomInspectionOverlay={Config.ShowRoomInspectionOverlay}, " +
             $"VisualEffectEnabled={VisualEffectEnabled}, " +
             $"DebugLogging={Config.DebugLogging}, " +
+            $"DebugRoomWindCallSiteProof={Config.DebugRoomWindCallSiteProof}, " +
             $"DebugRoomWindVisualProof={Config.DebugRoomWindVisualProof}, " +
             $"ApplyToGreenhouses={Config.ApplyToGreenhouses}, " +
             $"ApplyToCellars={Config.ApplyToCellars}, " +
@@ -342,10 +419,19 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
             $"ApplyToOtherVegetation={Config.ApplyToOtherVegetation}, " +
             $"ApplyToGrass={Config.ApplyToGrass}, " +
             $"ApplyToWater={Config.ApplyToWater}, " +
+            $"LegacyMaxAffectedPlantsIgnored={Config.MaxAffectedPlants}, " +
+            $"LegacyExperimentalExtendedPositionCapacityIgnored={Config.ExperimentalExtendedPositionCapacity}, " +
+            "RoomWindTransport=QuarterBlockTextureHash, " +
+            $"ClientForegroundWorkIntervalMs={Config.ClientForegroundWorkIntervalMs}, " +
+            $"MaxClientWaterChecksPerTick={Config.MaxClientWaterChecksPerTick}, " +
+            $"MaxClientChunkRedrawsPerTick={Config.MaxClientChunkRedrawsPerTick}, " +
             $"PlantMovementMode={PlantMovementMode}, " +
             $"GreenhouseWindRange={StillGreenhousesRoomWindEnvironment.DescribeRange(Config, ManagedRoomType.Greenhouse)}, " +
             $"CellarWindRange={StillGreenhousesRoomWindEnvironment.DescribeRange(Config, ManagedRoomType.Cellar)}, " +
             $"RoomWindRange={StillGreenhousesRoomWindEnvironment.DescribeRange(Config, ManagedRoomType.Room)}, " +
+            $"GreenhouseWaterWindRange={StillGreenhousesRoomWindEnvironment.DescribeRange(Config, ManagedRoomType.Greenhouse, RoomWindTargetKind.Water)}, " +
+            $"CellarWaterWindRange={StillGreenhousesRoomWindEnvironment.DescribeRange(Config, ManagedRoomType.Cellar, RoomWindTargetKind.Water)}, " +
+            $"RoomWaterWindRange={StillGreenhousesRoomWindEnvironment.DescribeRange(Config, ManagedRoomType.Room, RoomWindTargetKind.Water)}, " +
             $"RoomWindShaderOriginPrepared={StillGreenhousesRoomWindShaderPatch.OriginPrepared}, " +
             $"RoomWindShaderOriginPriorityIndex={StillGreenhousesRoomWindShaderPatch.OriginPriorityIndex}, " +
             $"RoomWindShaderOverrideReady={RoomWindShaderOverrideReady}, " +
@@ -433,6 +519,31 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
         return false;
     }
 
+    internal static bool TryGetCachedWindMeshRoom(
+        BlockPos pos,
+        bool requestIfUnknown,
+        [NotNullWhen(true)] out GreenhouseRegion? room
+    )
+    {
+        if (TryGetCachedGreenhouse(
+                pos,
+                requestIfUnknown: false,
+                out room
+            ))
+        {
+            return true;
+        }
+
+        // Container blocks such as flower pots may occupy the block at Pos
+        // while their plant mesh extends into the room cell immediately above.
+        // Probe that interior cell without hardcoding a container class.
+        return TryGetCachedGreenhouse(
+            pos.UpCopy(),
+            requestIfUnknown,
+            out room
+        );
+    }
+
     internal static bool HasCompleteCachedSnapshot(
         BlockPos pos
     )
@@ -458,10 +569,8 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
             return;
         }
 
-        ChunkKey chunkKey = ChunkKey.From(pos);
-
         RepresentativeVegetationByChunk.TryAdd(
-            chunkKey,
+            ChunkKey.From(pos),
             ObservedVegetationPos.From(pos)
         );
     }
@@ -596,6 +705,16 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
                 transformedMesh
             );
 
+        bool spatialProfileAvailable =
+            StillGreenhousesRoomWindUniformRenderer
+                .TryMeasureWindVertexEnvelope(
+                    sourceMesh,
+                    out ManagedRoomWindEnvelope allVertexEnvelope,
+                    out ManagedRoomWindEnvelope windVertexEnvelope,
+                    out int measuredVertexCount,
+                    out int measuredWindVertexCount
+                );
+
         DebugLiteral(
             $"[StillGreenhouses] ROOM WIND TARGET " +
             $"source={source}; " +
@@ -626,6 +745,57 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
             $"afterModes={afterProfile.ModeHistogram}"
         );
 
+        if (spatialProfileAvailable)
+        {
+            float maxEncodableHalfExtent =
+                StillGreenhousesRoomWindUniformRenderer
+                    .EnvelopeExtentMask
+                * StillGreenhousesRoomWindUniformRenderer
+                    .EnvelopeExtentQuantization;
+
+            bool extentClampRisk =
+                windVertexEnvelope.HalfExtentX
+                    + StillGreenhousesRoomWindUniformRenderer.EnvelopeMeasurementPadding
+                    > maxEncodableHalfExtent
+                || windVertexEnvelope.HalfExtentY
+                    + StillGreenhousesRoomWindUniformRenderer.EnvelopeMeasurementPadding
+                    > maxEncodableHalfExtent
+                || windVertexEnvelope.HalfExtentZ
+                    + StillGreenhousesRoomWindUniformRenderer.EnvelopeMeasurementPadding
+                    > maxEncodableHalfExtent;
+
+            DebugLiteral(
+                "[StillGreenhouses] ROOM WIND MESH SPATIAL PROFILE " +
+                $"source={source}; " +
+                $"code={block.Code}; " +
+                $"pos={pos.X},{pos.Y},{pos.Z}; " +
+                $"measuredVertices={measuredVertexCount}; " +
+                $"windVertices={measuredWindVertexCount}; " +
+                $"allLocalBounds=[{allVertexEnvelope.MinX:0.###},{allVertexEnvelope.MinY:0.###},{allVertexEnvelope.MinZ:0.###}.." +
+                $"{allVertexEnvelope.MaxX:0.###},{allVertexEnvelope.MaxY:0.###},{allVertexEnvelope.MaxZ:0.###}]; " +
+                $"windLocalBounds=[{windVertexEnvelope.MinX:0.###},{windVertexEnvelope.MinY:0.###},{windVertexEnvelope.MinZ:0.###}.." +
+                $"{windVertexEnvelope.MaxX:0.###},{windVertexEnvelope.MaxY:0.###},{windVertexEnvelope.MaxZ:0.###}]; " +
+                $"windCenter={windVertexEnvelope.CenterX:0.###},{windVertexEnvelope.CenterY:0.###},{windVertexEnvelope.CenterZ:0.###}; " +
+                $"windHalfExtents={windVertexEnvelope.HalfExtentX:0.###},{windVertexEnvelope.HalfExtentY:0.###},{windVertexEnvelope.HalfExtentZ:0.###}; " +
+                $"quantStep={StillGreenhousesRoomWindUniformRenderer.EnvelopeExtentQuantization:0.###}; " +
+                $"padding={StillGreenhousesRoomWindUniformRenderer.EnvelopeMeasurementPadding:0.####}; " +
+                $"maxEncodedHalfExtent={maxEncodableHalfExtent:0.###}; " +
+                $"extentClampRisk={extentClampRisk}; " +
+                "packing=CenterXYZ+Q6x3+Target4"
+            );
+        }
+        else
+        {
+            DebugLiteral(
+                "[StillGreenhouses] ROOM WIND MESH SPATIAL PROFILE " +
+                $"source={source}; " +
+                $"code={block.Code}; " +
+                $"pos={pos.X},{pos.Y},{pos.Z}; " +
+                "available=False; " +
+                "reason=no-finite-wind-vertex-envelope"
+            );
+        }
+
         DebugLiteral(
             "[StillGreenhouses] ROOM WIND VERTEX PROFILE " +
             $"source={source}; " +
@@ -642,7 +812,7 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
             $"after={afterProfile.ModeHistogram}; " +
             $"originalWindModePreserved={beforeProfile.ModeHistogram == afterProfile.ModeHistogram}; " +
             $"originalWindDataPreserved={beforeProfile.TupleHistogram == afterProfile.TupleHistogram}; " +
-            $"transport=SpatialPositionUniform"
+            $"transport=MeshWindVertexEnvelopeUniform"
         );
     }
 
@@ -945,14 +1115,21 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
                         ref latestPlayerChunkSnapshot
                     );
 
+                bool pipelineBusy =
+                    IsSnapshotPipelineBusy()
+                    || Volatile.Read(ref requestBatchHandoffInFlight) != 0;
+
                 if (
                     config?.Enabled != true
                     || playerSnapshot == null
                     || QueuedDiscoveryChunks.IsEmpty
+                    || pipelineBusy
                 )
                 {
                     await Task.Delay(
-                        50,
+                        pipelineBusy
+                            ? BusyPipelineRetryDelayMs
+                            : 50,
                         cancellationToken
                     );
 
@@ -1005,7 +1182,7 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
                 long selectionStart =
                     Stopwatch.GetTimestamp();
 
-                List<ChunkKey> selected = new(
+                List<PendingChunkRequest> selected = new(
                     batchLimit
                 );
 
@@ -1017,20 +1194,27 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
                     )
                 )
                 {
+                    long leaseId = Interlocked.Increment(
+                        ref nextPendingRequestLeaseId
+                    );
+
                     if (
-                        ChunkSnapshots.ContainsKey(
-                            chunkKey
-                        )
+                        ChunkSnapshots.ContainsKey(chunkKey)
                         || !PendingChunkRequests.TryAdd(
                             chunkKey,
-                            0
+                            leaseId
                         )
                     )
                     {
                         continue;
                     }
 
-                    selected.Add(chunkKey);
+                    selected.Add(
+                        new PendingChunkRequest(
+                            chunkKey,
+                            leaseId
+                        )
+                    );
                 }
 
                 double selectionElapsedMs =
@@ -1048,20 +1232,92 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
                     continue;
                 }
 
-                requestBudget -=
-                    selected.Count;
-
                 PreparedRequestBatch batch = new(
                     selected.ToArray(),
                     playerSnapshot.Generation,
                     selectionElapsedMs
                 );
 
-                api.Event.EnqueueMainThreadTask(
-                    () => SendPreparedRequestBatch(
-                        batch
-                    ),
-                    "stillgreenhouses-send-request-batch"
+                if (
+                    batch.Generation
+                        != Volatile.Read(
+                            ref clientWorldGeneration
+                        )
+                    || IsSnapshotPipelineBusy()
+                )
+                {
+                    RequeuePreparedRequestBatch(batch);
+
+                    await Task.Delay(
+                        BusyPipelineRetryDelayMs,
+                        cancellationToken
+                    );
+
+                    continue;
+                }
+
+                int handoffMarker =
+                    GetRequestBatchHandoffMarker(
+                        batch.Generation
+                    );
+
+                if (
+                    Interlocked.CompareExchange(
+                        ref requestBatchHandoffInFlight,
+                        handoffMarker,
+                        0
+                    ) != 0
+                )
+                {
+                    RequeuePreparedRequestBatch(batch);
+
+                    await Task.Delay(
+                        BusyPipelineRetryDelayMs,
+                        cancellationToken
+                    );
+
+                    continue;
+                }
+
+                requestBudget -=
+                    selected.Count;
+
+                try
+                {
+                    api.Event.EnqueueMainThreadTask(
+                        () => CompletePreparedRequestBatchHandoff(
+                            batch
+                        ),
+                        "stillgreenhouses-send-request-batch"
+                    );
+                }
+                catch (Exception e)
+                {
+                    Interlocked.CompareExchange(
+                        ref requestBatchHandoffInFlight,
+                        0,
+                        handoffMarker
+                    );
+
+                    RequeuePreparedRequestBatch(batch);
+
+                    QueueWorkerWarning(
+                        api,
+                        "Request batch handoff failed",
+                        e
+                    );
+
+                    await Task.Delay(
+                        BusyPipelineRetryDelayMs,
+                        cancellationToken
+                    );
+
+                    continue;
+                }
+
+                await Task.Delay(
+                    WorkerHandoffDelayMs,
+                    cancellationToken
                 );
             }
         }
@@ -1145,7 +1401,7 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
         )
         {
             ReleasePendingRequestLeases(
-                batch.Chunks,
+                batch.Requests,
                 scheduleRetry: false
             );
 
@@ -1155,7 +1411,7 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
         if (channel?.Connected != true)
         {
             ReleasePendingRequestLeases(
-                batch.Chunks,
+                batch.Requests,
                 scheduleRetry: true
             );
 
@@ -1165,8 +1421,8 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
         GreenhouseChunkBatchRequest packet =
             new()
             {
-                Chunks = batch.Chunks
-                    .Select(chunk => chunk.ToRequest())
+                Chunks = batch.Requests
+                    .Select(request => request.Chunk.ToRequest())
                     .ToList()
             };
 
@@ -1177,6 +1433,8 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
         {
             channel.SendPacket(packet);
 
+            ScheduleResponseTimeout(batch);
+
             double sendElapsedMs =
                 GetElapsedMilliseconds(
                     sendStart
@@ -1186,62 +1444,186 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
             {
                 string keys = string.Join(
                     "|",
-                    batch.Chunks.Select(chunk =>
-                        $"{chunk.X},{chunk.Y},{chunk.Z},{chunk.Dimension}"
+                    batch.Requests.Select(request =>
+                        $"{request.Chunk.X},{request.Chunk.Y},{request.Chunk.Z},{request.Chunk.Dimension}"
                     )
                 );
 
                 DebugLiteral(
                     "[StillGreenhouses] CLIENT REQUEST BATCH " +
-                    $"chunks={batch.Chunks.Length}; " +
+                    $"chunks={batch.Requests.Length}; " +
                     $"keys={keys}"
                 );
 
                 LogSlowClientOperation(
                     "select-discovery-batch",
                     batch.SelectionElapsedMs,
-                    $"chunks={batch.Chunks.Length}; thread=worker"
+                    $"chunks={batch.Requests.Length}; thread=worker"
                 );
 
                 LogSlowClientOperation(
                     "send-request-batch",
                     sendElapsedMs,
-                    $"chunks={batch.Chunks.Length}; thread=main"
+                    $"chunks={batch.Requests.Length}; thread=main"
                 );
             }
         }
         catch (Exception e)
         {
             ReleasePendingRequestLeases(
-                batch.Chunks,
+                batch.Requests,
                 scheduleRetry: true
             );
 
             WarningLiteral(
                 "[StillGreenhouses] Failed to send room " +
-                $"discovery batch. chunks={batch.Chunks.Length}. " +
+                $"discovery batch. chunks={batch.Requests.Length}. " +
                 $"{e.GetType().Name}: {e.Message}"
             );
         }
     }
 
+    private static void CompletePreparedRequestBatchHandoff(
+        PreparedRequestBatch batch
+    )
+    {
+        int handoffMarker =
+            GetRequestBatchHandoffMarker(
+                batch.Generation
+            );
+
+        try
+        {
+            if (IsSnapshotPipelineBusy())
+            {
+                RequeuePreparedRequestBatch(batch);
+            }
+            else
+            {
+                SendPreparedRequestBatch(batch);
+            }
+        }
+        finally
+        {
+            Interlocked.CompareExchange(
+                ref requestBatchHandoffInFlight,
+                0,
+                handoffMarker
+            );
+        }
+    }
+
+    private static int GetRequestBatchHandoffMarker(
+        int generation
+    )
+    {
+        int marker = unchecked(generation + 1);
+
+        return marker == 0
+            ? int.MinValue
+            : marker;
+    }
+
+    private static void RequeuePreparedRequestBatch(
+        PreparedRequestBatch batch
+    )
+    {
+        ReleasePendingRequestLeases(
+            batch.Requests,
+            scheduleRetry: false
+        );
+
+        if (
+            batch.Generation
+                != Volatile.Read(
+                    ref clientWorldGeneration
+                )
+        )
+        {
+            return;
+        }
+
+        foreach (PendingChunkRequest request in batch.Requests)
+        {
+            if (!ChunkSnapshots.ContainsKey(request.Chunk))
+            {
+                QueuedDiscoveryChunks.TryAdd(
+                    request.Chunk,
+                    0
+                );
+            }
+        }
+    }
+
     private static void ReleasePendingRequestLeases(
-        IEnumerable<ChunkKey> chunks,
+        IEnumerable<PendingChunkRequest> requests,
         bool scheduleRetry
     )
     {
-        foreach (ChunkKey chunkKey in chunks)
+        foreach (PendingChunkRequest request in requests)
         {
-            PendingChunkRequests.TryRemove(
-                chunkKey,
-                out _
-            );
+            bool released = TryReleasePendingRequestLease(request);
 
-            if (scheduleRetry)
+            if (released && scheduleRetry)
             {
-                ScheduleRetry(chunkKey);
+                ScheduleRetry(request.Chunk);
             }
         }
+    }
+
+    private static bool TryReleasePendingRequestLease(
+        PendingChunkRequest request
+    ) =>
+        PendingChunkRequests.TryRemove(
+            new KeyValuePair<ChunkKey, long>(
+                request.Chunk,
+                request.LeaseId
+            )
+        );
+
+    private static void ScheduleResponseTimeout(
+        PreparedRequestBatch batch
+    )
+    {
+        ICoreClientAPI? api = Capi;
+        StillGreenhousesConfig? config = Config;
+
+        if (api == null || config?.Enabled != true)
+        {
+            return;
+        }
+
+        api.Event.RegisterCallback(
+            _elapsedSeconds =>
+            {
+                if (
+                    batch.Generation
+                        != Volatile.Read(
+                            ref clientWorldGeneration
+                        )
+                )
+                {
+                    return;
+                }
+
+                foreach (
+                    PendingChunkRequest request
+                    in batch.Requests
+                )
+                {
+                    if (!TryReleasePendingRequestLease(request))
+                    {
+                        continue;
+                    }
+
+                    if (!ChunkSnapshots.ContainsKey(request.Chunk))
+                    {
+                        RequestChunk(request.Chunk);
+                    }
+                }
+            },
+            config.ClientIncompleteRetryMs
+        );
     }
 
     private static void OnChunkSnapshot(
@@ -1272,10 +1654,6 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
 
         if (queue.Writer.TryWrite(queued))
         {
-            Interlocked.Increment(
-                ref snapshotPacketsQueued
-            );
-
             return;
         }
 
@@ -1297,10 +1675,6 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
             await writer.WriteAsync(
                 queued,
                 cancellationToken
-            );
-
-            Interlocked.Increment(
-                ref snapshotPacketsQueued
             );
         }
         catch (OperationCanceledException)
@@ -1326,6 +1700,38 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
         }
     }
 
+    private static int GetQueuedSnapshotPacketCount()
+    {
+        Channel<QueuedSnapshotPacket>? queue =
+            snapshotPreparationQueue;
+
+        if (queue == null)
+        {
+            return 0;
+        }
+
+        try
+        {
+            return queue.Reader.CanCount
+                ? queue.Reader.Count
+                : queue.Reader.TryPeek(out _)
+                    ? 1
+                    : 0;
+        }
+        catch
+        {
+            // A queue can be replaced during a world transition. Treat the old
+            // reader as empty; its generation checks will discard stale work.
+            return 0;
+        }
+    }
+
+    private static bool IsSnapshotPipelineBusy() =>
+        GetQueuedSnapshotPacketCount() > 0
+        || Volatile.Read(
+            ref snapshotPipelineInFlight
+        ) != 0;
+
     private static async Task RunSnapshotPreparationWorkerAsync(
         ICoreClientAPI api,
         ChannelReader<QueuedSnapshotPacket> reader,
@@ -1341,68 +1747,86 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
                 )
             )
             {
-                Interlocked.Decrement(
-                    ref snapshotPacketsQueued
+                Interlocked.Increment(
+                    ref snapshotPipelineInFlight
                 );
 
-                SnapshotCommitDisposition disposition;
-
-                do
+                try
                 {
-                    PreparedChunkSnapshot prepared =
-                        PrepareChunkSnapshot(
-                            queued
+                    SnapshotCommitDisposition disposition;
+
+                    do
+                    {
+                        PreparedChunkSnapshot prepared =
+                            PrepareChunkSnapshot(
+                                queued
+                            );
+
+                        TaskCompletionSource<
+                            SnapshotCommitDisposition
+                        > completion = new(
+                            TaskCreationOptions
+                                .RunContinuationsAsynchronously
                         );
 
-                    TaskCompletionSource<
-                        SnapshotCommitDisposition
-                    > completion = new(
-                        TaskCreationOptions
-                            .RunContinuationsAsynchronously
+                        api.Event.EnqueueMainThreadTask(
+                            () =>
+                            {
+                                try
+                                {
+                                    completion.TrySetResult(
+                                        CommitPreparedSnapshot(
+                                            prepared
+                                        )
+                                    );
+                                }
+                                catch (Exception e)
+                                {
+                                    WarningLiteral(
+                                        "[StillGreenhouses] Prepared snapshot " +
+                                        $"commit failed. {e.GetType().Name}: " +
+                                        $"{e.Message}"
+                                    );
+
+                                    completion.TrySetResult(
+                                        SnapshotCommitDisposition.Drop
+                                    );
+                                }
+                            },
+                            "stillgreenhouses-commit-prepared-snapshot"
+                        );
+
+                        disposition =
+                            await completion
+                                .Task
+                                .WaitAsync(
+                                    cancellationToken
+                                );
+                    }
+                    while (
+                        disposition
+                        == SnapshotCommitDisposition.Reprepare
+                        && queued.Generation
+                            == Volatile.Read(
+                                ref clientWorldGeneration
+                            )
                     );
 
-                    api.Event.EnqueueMainThreadTask(
-                        () =>
-                        {
-                            try
-                            {
-                                completion.TrySetResult(
-                                    CommitPreparedSnapshot(
-                                        prepared
-                                    )
-                                );
-                            }
-                            catch (Exception e)
-                            {
-                                WarningLiteral(
-                                    "[StillGreenhouses] Prepared snapshot " +
-                                    $"commit failed. {e.GetType().Name}: " +
-                                    $"{e.Message}"
-                                );
-
-                                completion.TrySetResult(
-                                    SnapshotCommitDisposition.Drop
-                                );
-                            }
-                        },
-                        "stillgreenhouses-commit-prepared-snapshot"
+                    // Keep the pipeline marked busy through one short handoff
+                    // window. Diagnostic logging used to provide this pacing by
+                    // accident; making it explicit prevents discovery sends from
+                    // overtaking a snapshot commit in release builds.
+                    await Task.Delay(
+                        WorkerHandoffDelayMs,
+                        cancellationToken
                     );
-
-                    disposition =
-                        await completion
-                            .Task
-                            .WaitAsync(
-                                cancellationToken
-                            );
                 }
-                while (
-                    disposition
-                    == SnapshotCommitDisposition.Reprepare
-                    && queued.Generation
-                        == Volatile.Read(
-                            ref clientWorldGeneration
-                        )
-                );
+                finally
+                {
+                    Interlocked.Decrement(
+                        ref snapshotPipelineInFlight
+                    );
+                }
             }
         }
         catch (OperationCanceledException)
@@ -1436,8 +1860,7 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
             packet.Greenhouses
                 .Select(GreenhouseRegion.FromPacket)
                 .Where(region =>
-                    region.GetIntersectingChunks()
-                        .Contains(chunkKey)
+                    region.IntersectsChunk(chunkKey)
                 )
                 .ToArray();
 
@@ -1449,22 +1872,78 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
         RoomPolicySnapshot policy =
             RoomPolicySnapshot.From(Config);
 
-        HashSet<GreenhouseMembershipPos> oldMembership =
-            BuildConfiguredWindMembershipSet(
-                oldSnapshot?.Greenhouses
-                    ?? Array.Empty<GreenhouseRegion>(),
-                policy
+        GreenhouseMembershipPos[] newConfiguredPositions;
+        int changedConfiguredPositionCount;
+        int addedConfiguredPositionCount;
+        bool changedTouchesChunkMinY;
+
+        if (
+            oldSnapshot != null
+            && oldSnapshot.ContentHash == packet.ContentHash
+        )
+        {
+            // A visual-only revision carries the same authoritative room
+            // membership. Avoid rebuilding two room-sized hash sets and a
+            // symmetric difference that cannot contain any positions.
+            newConfiguredPositions =
+                Array.Empty<GreenhouseMembershipPos>();
+
+            changedConfiguredPositionCount = 0;
+            addedConfiguredPositionCount = 0;
+            changedTouchesChunkMinY = false;
+        }
+        else
+        {
+            HashSet<GreenhouseMembershipPos> oldMembership =
+                BuildConfiguredWindMembershipSet(
+                    oldSnapshot?.Greenhouses
+                        ?? Array.Empty<GreenhouseRegion>(),
+                    policy,
+                    chunkKey
+                );
+
+            HashSet<GreenhouseMembershipPos> newMembership =
+                BuildConfiguredWindMembershipSet(
+                    regions,
+                    policy,
+                    chunkKey
+                );
+
+            HashSet<GreenhouseMembershipPos> changedPositions =
+                new(newMembership);
+
+            changedPositions.SymmetricExceptWith(
+                oldMembership
             );
 
-        HashSet<GreenhouseMembershipPos> changedPositions =
-            BuildConfiguredWindMembershipSet(
-                regions,
-                policy
-            );
+            newConfiguredPositions =
+                newMembership.ToArray();
 
-        changedPositions.SymmetricExceptWith(
-            oldMembership
-        );
+            changedConfiguredPositionCount =
+                changedPositions.Count;
+
+            addedConfiguredPositionCount = 0;
+
+            foreach (
+                GreenhouseMembershipPos position
+                in newMembership
+            )
+            {
+                if (!oldMembership.Contains(position))
+                {
+                    addedConfiguredPositionCount++;
+                }
+            }
+
+            int chunkMinY =
+                chunkKey.Y
+                * StillGreenhousesShared.ChunkSize;
+
+            changedTouchesChunkMinY =
+                changedPositions.Any(
+                    position => position.Y == chunkMinY
+                );
+        }
 
         ClientChunkSnapshot newSnapshot = new(
             packet.Revision,
@@ -1484,7 +1963,10 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
                     Array.Empty<GreenhouseRegion>()
                 ),
             policy,
-            changedPositions.ToArray(),
+            newConfiguredPositions,
+            changedConfiguredPositionCount,
+            addedConfiguredPositionCount,
+            changedTouchesChunkMinY,
             GetElapsedMilliseconds(
                 preparationStart
             )
@@ -1615,9 +2097,15 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
             return SnapshotCommitDisposition.Drop;
         }
 
+        bool authoritativeVisualTransition =
+            oldSnapshot != null
+            && packet.VisualRevision
+                > oldSnapshot.VisualRevision;
+
         if (
             !packet.Complete
             && oldSnapshot?.Greenhouses.Length > 0
+            && !authoritativeVisualTransition
         )
         {
             QueuedDiscoveryChunks.TryRemove(
@@ -1638,6 +2126,7 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
                     $"dim={chunkKey.Dimension}; " +
                     $"incomingRevision={packet.Revision}; " +
                     $"incomingVisualRevision={packet.VisualRevision}; " +
+                    $"cachedVisualRevision={oldSnapshot.VisualRevision}; " +
                     "reason=incomplete-positive-revalidation"
                 );
             }
@@ -1648,69 +2137,84 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
         long commitStart =
             Stopwatch.GetTimestamp();
 
+        bool roomMembershipChanged =
+            prepared.ChangedConfiguredPositionCount > 0;
+
         bool configuredMembershipChanged =
-            false;
-
-        int checkedPositions = 0;
-
-        foreach (
-            GreenhouseMembershipPos position
-            in prepared.ChangedConfiguredPositions
-        )
-        {
-            checkedPositions++;
-
-            Block block =
-                api.World.BlockAccessor
-                    .GetBlock(
-                        position.ToBlockPos()
-                    );
-
-            if (
-                StillGreenhousesShared
-                    .IsVegetationCandidate(
-                        block,
-                        Config
+            roomMembershipChanged
+            && (
+                RepresentativeVegetationByChunk.ContainsKey(
+                    chunkKey
+                )
+                || StillGreenhousesRoomWindUniformRenderer
+                    .HasRegisteredVegetationPositionsForChunk(
+                        chunkKey
                     )
-            )
-            {
-                configuredMembershipChanged =
-                    true;
-
-                break;
-            }
-        }
-
-        long oldVisualRevision =
-            oldSnapshot?.VisualRevision
-            ?? 0;
-
-        bool visualRevisionChanged =
-            oldSnapshot != null
-            && oldVisualRevision
-                != prepared.NewSnapshot.VisualRevision;
+            );
 
         bool contentChanged =
             prepared.ExpectedOldContentHash
             != prepared.NewSnapshot.ContentHash;
 
-        int removedRoomWindRegistrations = 0;
-
-        if (configuredMembershipChanged)
-        {
-            removedRoomWindRegistrations =
-                StillGreenhousesRoomWindUniformRenderer
-                    .RemovePositionsForChunk(chunkKey);
-        }
-
         ChunkSnapshots[
             chunkKey
         ] = prepared.NewSnapshot;
 
-        RegisterRoomWaterSources(
-            api,
-            prepared.NewSnapshot
-        );
+        RoomWindRegistrationReconcileResult
+            registrationReconcile = default;
+
+        if (roomMembershipChanged)
+        {
+            registrationReconcile =
+                StillGreenhousesRoomWindUniformRenderer
+                    .ReconcilePositionsForChunk(chunkKey);
+        }
+
+        bool belowChunkRedrawQueued = false;
+
+        if (prepared.ChangedTouchesChunkMinY)
+        {
+            ChunkKey belowChunk = new(
+                chunkKey.X,
+                chunkKey.Y - 1,
+                chunkKey.Z,
+                chunkKey.Dimension
+            );
+
+            if (StillGreenhousesRoomWindUniformRenderer
+                    .HasRegisteredVegetationPositionsForChunk(
+                        belowChunk
+                    ))
+            {
+                StillGreenhousesRoomWindUniformRenderer
+                    .ReconcilePositionsForChunk(
+                        belowChunk
+                    );
+
+                if (prepared.AddedConfiguredPositionCount > 0)
+                {
+                    belowChunkRedrawQueued = QueueChunkRedraw(
+                        belowChunk,
+                        "snapshot-membership-addition-above"
+                    );
+                }
+            }
+        }
+
+        bool waterScanQueued =
+            contentChanged
+            || !prepared.ExpectedOldSnapshotExists
+            || roomMembershipChanged;
+
+        if (waterScanQueued)
+        {
+            QueueRoomWaterSourceScan(
+                chunkKey,
+                prepared.NewSnapshot,
+                prepared.NewConfiguredPositions,
+                prepared.Queued.Generation
+            );
+        }
 
         IgnoreNextCompleteNegativeSnapshot.TryRemove(
             chunkKey,
@@ -1727,13 +2231,16 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
             out _
         );
 
-        if (configuredMembershipChanged)
-        {
-            MarkChunkDirty(
-                api,
-                chunkKey
+        bool redrawRequested =
+            configuredMembershipChanged
+            && prepared.AddedConfiguredPositionCount > 0;
+
+        bool redrawQueued =
+            redrawRequested
+            && QueueChunkRedraw(
+                chunkKey,
+                "snapshot-membership-addition"
             );
-        }
 
         double commitElapsedMs =
             GetElapsedMilliseconds(
@@ -1758,10 +2265,21 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
                     $"greenhouses={prepared.NewSnapshot.Greenhouses.Length}; " +
                     $"contentHash=0x{packet.ContentHash:X16}; " +
                     $"contentChanged={contentChanged}; " +
-                    $"visualRevisionChanged={visualRevisionChanged}; " +
+                    $"visualRevisionChanged={oldSnapshot != null && oldSnapshot.VisualRevision != prepared.NewSnapshot.VisualRevision}; " +
+                    $"authoritativeVisualTransition={authoritativeVisualTransition}; " +
                     $"configuredMembershipChanged={configuredMembershipChanged}; " +
-                    $"removedRoomWindRegistrations={removedRoomWindRegistrations}; " +
-                    $"redraw={configuredMembershipChanged}"
+                    $"addedConfiguredPositions={prepared.AddedConfiguredPositionCount}; " +
+                    $"roomWindRegisteredBefore={registrationReconcile.RegisteredBefore}; " +
+                    $"roomWindRetained={registrationReconcile.Retained}; " +
+                    $"roomWindRoomTypeUpdated={registrationReconcile.RoomTypeUpdated}; " +
+                    $"roomWindRoomIdentityUpdated={registrationReconcile.RoomIdentityUpdated}; " +
+                    $"removedRoomWindRegistrations={registrationReconcile.Removed}; " +
+                    $"removedRoomWindWaterTargets={registrationReconcile.WaterTargetsRemoved}; " +
+                    $"waterScanQueued={waterScanQueued}; " +
+                    $"waterScanQueuedPositions={(waterScanQueued ? prepared.NewConfiguredPositions.Length : 0)}; " +
+                    $"redrawRequested={redrawRequested}; " +
+                    $"redrawQueued={redrawQueued}; " +
+                    $"belowChunkRedrawQueued={belowChunkRedrawQueued}"
                 );
             }
 
@@ -1769,15 +2287,19 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
                 "prepare-snapshot",
                 prepared.PreparationElapsedMs,
                 $"regions={prepared.NewSnapshot.Greenhouses.Length}; " +
-                $"changedPositions={prepared.ChangedConfiguredPositions.Length}; " +
+                $"changedPositions={prepared.ChangedConfiguredPositionCount}; " +
                 "thread=worker"
             );
 
             LogSlowClientOperation(
                 "commit-snapshot",
                 commitElapsedMs,
-                $"checkedPositions={checkedPositions}; " +
-                $"redraw={configuredMembershipChanged}; " +
+                "foregroundBlockQueries=0; " +
+                $"changedMembershipPositions={prepared.ChangedConfiguredPositionCount}; " +
+                $"redrawEvidence=observed-or-registered-vegetation; " +
+                $"waterScanQueued={waterScanQueued}; " +
+                $"redrawQueued={redrawQueued}; " +
+                $"belowChunkRedrawQueued={belowChunkRedrawQueued}; " +
                 "thread=main"
             );
         }
@@ -1788,7 +2310,8 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
     private static HashSet<GreenhouseMembershipPos>
         BuildConfiguredWindMembershipSet(
             IEnumerable<GreenhouseRegion> regions,
-            RoomPolicySnapshot policy
+            RoomPolicySnapshot policy,
+            ChunkKey chunkKey
         )
     {
         HashSet<GreenhouseMembershipPos> result =
@@ -1806,7 +2329,9 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
 
             foreach (
                 BlockPos pos
-                in region.GetOccupiedPositions()
+                in region.GetOccupiedPositionsInChunk(
+                    chunkKey
+                )
             )
             {
                 result.Add(
@@ -1835,9 +2360,23 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
             return;
         }
 
+        int generation = Volatile.Read(
+            ref clientWorldGeneration
+        );
+
         api.Event.RegisterCallback(
             _elapsedSeconds =>
             {
+                if (
+                    generation
+                        != Volatile.Read(
+                            ref clientWorldGeneration
+                        )
+                )
+                {
+                    return;
+                }
+
                 ScheduledRetries.TryRemove(
                     chunkKey,
                     out _
@@ -1932,9 +2471,154 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
         );
     }
 
-    private static void RegisterRoomWaterSources(
-        ICoreClientAPI api,
-        ClientChunkSnapshot snapshot
+    internal static void LogWindMeshFallbackTargetOnce(
+        Block block,
+        BlockPos pos,
+        GreenhouseRegion room
+    )
+    {
+        if (Config?.DebugLogging != true)
+        {
+            return;
+        }
+
+        string code =
+            block.Code?.ToString()
+            ?? "<null-code>";
+
+        if (!KnownWindMeshFallbackTargets.TryAdd(code, 0))
+        {
+            return;
+        }
+
+        DebugLiteral(
+            "[StillGreenhouses] ROOM WIND WIND-MESH FALLBACK TARGET " +
+            $"code={code}; " +
+            $"runtime={block.GetType().FullName ?? block.GetType().Name}; " +
+            $"material={block.BlockMaterial}; " +
+            $"pos={pos.X},{pos.Y},{pos.Z}; " +
+            $"dim={pos.dimension}; " +
+            $"roomType={room.RoomType}; " +
+            "reason=active-native-windmode+ApplyToOtherVegetation"
+        );
+    }
+
+    internal static void LogContainerWindTargetOnce(
+        string source,
+        BlockEntity blockEntity,
+        GreenhouseRegion room,
+        MeshData mesh,
+        ManagedRoomWindEnvelope envelope,
+        bool transformedByMeshPoolMatrix
+    )
+    {
+        if (Config?.DebugLogging != true)
+        {
+            return;
+        }
+
+        Block block = blockEntity.Block;
+
+        ContainerWindTargetLogKey key = new(
+            block.Code?.ToString() ?? "<null-code>",
+            blockEntity.GetType().FullName
+                ?? blockEntity.GetType().Name,
+            source
+        );
+
+        if (!KnownContainerWindTargets.TryAdd(key, 0))
+        {
+            return;
+        }
+
+        WindVertexProfile profile =
+            BuildWindVertexProfile(mesh);
+
+        DebugLiteral(
+            "[StillGreenhouses] ROOM WIND CONTAINED VEGETATION TARGET " +
+            $"source={source}; " +
+            $"containerCode={key.ContainerCode}; " +
+            $"containerRuntime={key.ContainerRuntime}; " +
+            $"pos={blockEntity.Pos.X},{blockEntity.Pos.Y},{blockEntity.Pos.Z}; " +
+            $"dim={blockEntity.Pos.dimension}; " +
+            $"roomType={room.RoomType}; " +
+            $"meshIdentity={RuntimeHelpers.GetHashCode(mesh)}; " +
+            $"vertices={profile.VertexCount}; " +
+            $"windVertices={profile.WindVertices}; " +
+            $"windModes={profile.ModeHistogram}; " +
+            $"transformedByMeshPoolMatrix={transformedByMeshPoolMatrix}; " +
+            $"windEnvelope={FormatEnvelopeForLog(envelope)}; " +
+            "eligibility=ActiveVanillaWindMode+ApplyToOtherVegetation"
+        );
+    }
+
+    internal static void LogFlowerMeshProcess(
+        string source,
+        Block block,
+        BlockPos pos,
+        MeshData mesh,
+        ManagedRoomWindEnvelope measuredEnvelope,
+        ManagedRoomWindEnvelope registrationEnvelope
+    )
+    {
+        if (
+            Config?.DebugLogging != true
+            || block.Code?.Path?.StartsWith(
+                "flower-",
+                StringComparison.Ordinal
+            ) != true
+        )
+        {
+            return;
+        }
+
+        int meshIdentity =
+            RuntimeHelpers.GetHashCode(mesh);
+
+        FlowerMeshProcessLogKey key = new(
+            block.Code?.ToString() ?? "<null-code>",
+            source,
+            pos.X,
+            pos.Y,
+            pos.Z,
+            pos.dimension,
+            meshIdentity
+        );
+
+        if (!KnownFlowerMeshProcesses.TryAdd(key, 0))
+        {
+            return;
+        }
+
+        DebugLiteral(
+            "[StillGreenhouses] ROOM WIND FLOWER MESH PROCESS " +
+            $"source={source}; " +
+            $"code={block.Code}; " +
+            $"pos={pos.X},{pos.Y},{pos.Z}; " +
+            $"dim={pos.dimension}; " +
+            $"meshIdentity={meshIdentity}; " +
+            $"vertices={mesh.VerticesCount}; " +
+            $"randomizeRotations={block.RandomizeRotations}; " +
+            $"randomDrawOffset={block.RandomDrawOffset}; " +
+            $"measuredWindEnvelope={FormatEnvelopeForLog(measuredEnvelope)}; " +
+            $"registeredWindEnvelope={FormatEnvelopeForLog(registrationEnvelope)}; " +
+            $"snapshotKnown={ChunkSnapshots.ContainsKey(ChunkKey.From(pos))}; " +
+            $"thread={Environment.CurrentManagedThreadId}"
+        );
+    }
+
+    private static string FormatEnvelopeForLog(
+        ManagedRoomWindEnvelope envelope
+    ) =>
+        FormattableString.Invariant(
+            $"[{envelope.MinX:0.###},{envelope.MinY:0.###},{envelope.MinZ:0.###}..{envelope.MaxX:0.###},{envelope.MaxY:0.###},{envelope.MaxZ:0.###}]"
+        );
+
+    private static void QueueRoomWaterSourceScan(
+        ChunkKey chunkKey,
+        ClientChunkSnapshot snapshot,
+        GreenhouseMembershipPos[] configuredPositions,
+        int generation
     )
     {
         StillGreenhousesConfig? config =
@@ -1942,46 +2626,283 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
 
         if (
             config?.ApplyToWater != true
-            || PlantMovementMode
-                != RoomPlantMovementMode.VanillaLowWind
+            || !StillGreenhousesRoomWindEnvironment
+                .IsShaderDrivenMode(PlantMovementMode)
+            || configuredPositions.Length == 0
         )
         {
             return;
         }
 
-        foreach (
-            GreenhouseRegion region
-            in snapshot.Greenhouses
+        LatestQueuedWaterScanRevision[
+            chunkKey
+        ] = snapshot.Revision;
+
+        PendingWaterScanBatches.Enqueue(
+            new PendingWaterScanBatch(
+                chunkKey,
+                snapshot.Revision,
+                configuredPositions,
+                generation
+            )
+        );
+    }
+
+    private static void ProcessClientForegroundWork(
+        float dt
+    )
+    {
+        ICoreClientAPI? api = Capi;
+        StillGreenhousesConfig? config = Config;
+
+        if (
+            api == null
+            || config?.Enabled != true
         )
         {
-            if (!StillGreenhousesShared.IsRoomTypeEnabled(
-                    config,
-                    region.RoomType
-                ))
+            return;
+        }
+
+        if (
+            PendingWaterScanBatches.IsEmpty
+            && PendingChunkRedrawQueue.IsEmpty
+        )
+        {
+            return;
+        }
+
+        bool measurePerformance =
+            config.DebugLogging;
+
+        long startTimestamp =
+            measurePerformance
+                ? Stopwatch.GetTimestamp()
+                : 0;
+
+        int waterChecked = 0;
+        int waterRegistered = 0;
+        int waterBatchesDropped = 0;
+        int redrawsProcessed = 0;
+        int waterBatchAttempts = 0;
+        int redrawAttempts = 0;
+
+        int maxWaterBatchAttempts = Math.Clamp(
+            config.MaxClientWaterChecksPerTick,
+            16,
+            256
+        );
+
+        int maxRedrawAttempts = Math.Clamp(
+            config.MaxClientChunkRedrawsPerTick * 4,
+            16,
+            256
+        );
+
+        while (
+            waterChecked
+                < config.MaxClientWaterChecksPerTick
+            && waterBatchAttempts
+                < maxWaterBatchAttempts
+            && PendingWaterScanBatches.TryPeek(
+                out PendingWaterScanBatch? batch
+            )
+        )
+        {
+            waterBatchAttempts++;
+
+            bool stale =
+                batch.Generation
+                    != Volatile.Read(
+                        ref clientWorldGeneration
+                    )
+                || !LatestQueuedWaterScanRevision.TryGetValue(
+                    batch.Chunk,
+                    out long latestRevision
+                )
+                || latestRevision != batch.Revision
+                || !ChunkSnapshots.TryGetValue(
+                    batch.Chunk,
+                    out ClientChunkSnapshot? currentSnapshot
+                )
+                || currentSnapshot.Revision
+                    != batch.Revision;
+
+            if (stale)
             {
+                PendingWaterScanBatches.TryDequeue(
+                    out _
+                );
+
+                waterBatchesDropped++;
+
                 continue;
             }
 
-            foreach (
-                BlockPos pos
-                in region.GetOccupiedPositions()
+            while (
+                batch.NextIndex
+                    < batch.Positions.Length
+                && waterChecked
+                    < config.MaxClientWaterChecksPerTick
             )
             {
-                if (!StillGreenhousesShared.IsWaterSurfaceSourceBlock(
-                        api.World.BlockAccessor,
-                        pos
-                    ))
+                BlockPos pos =
+                    batch.Positions[
+                        batch.NextIndex++
+                    ].ToBlockPos();
+
+                waterChecked++;
+
+                if (
+                    !StillGreenhousesShared
+                        .IsWaterSurfaceSourceBlock(
+                            api.World.BlockAccessor,
+                            pos
+                        )
+                    || !TryGetCachedGreenhouse(
+                        pos,
+                        requestIfUnknown: false,
+                        out GreenhouseRegion? room
+                    )
+                    || !StillGreenhousesShared
+                        .IsRoomTypeEnabled(
+                            config,
+                            room.RoomType
+                        )
+                )
                 {
+                    StillGreenhousesRoomWindUniformRenderer
+                        .RemoveWaterPosition(pos);
+
                     continue;
                 }
 
                 StillGreenhousesRoomWindUniformRenderer
                     .RegisterWaterPosition(
                         pos,
-                        region
+                        room
                     );
+
+                waterRegistered++;
+            }
+
+            if (
+                batch.NextIndex
+                    < batch.Positions.Length
+            )
+            {
+                break;
+            }
+
+            PendingWaterScanBatches.TryDequeue(
+                out _
+            );
+
+            if (
+                LatestQueuedWaterScanRevision.TryGetValue(
+                    batch.Chunk,
+                    out long completedRevision
+                )
+                && completedRevision
+                    == batch.Revision
+            )
+            {
+                LatestQueuedWaterScanRevision.TryRemove(
+                    batch.Chunk,
+                    out _
+                );
             }
         }
+
+        while (
+            redrawsProcessed
+                < config.MaxClientChunkRedrawsPerTick
+            && redrawAttempts
+                < maxRedrawAttempts
+            && PendingChunkRedrawQueue.TryDequeue(
+                out ChunkKey chunkKey
+            )
+        )
+        {
+            redrawAttempts++;
+
+            if (!PendingChunkRedraws.TryRemove(
+                    chunkKey,
+                    out _
+                ))
+            {
+                continue;
+            }
+
+            MarkChunkDirty(
+                api,
+                chunkKey
+            );
+
+            redrawsProcessed++;
+        }
+
+        Interlocked.Add(
+            ref waterScanPositionsChecked,
+            waterChecked
+        );
+
+        Interlocked.Add(
+            ref waterScanPositionsRegistered,
+            waterRegistered
+        );
+
+        Interlocked.Add(
+            ref waterScanBatchesDropped,
+            waterBatchesDropped
+        );
+
+        Interlocked.Add(
+            ref chunkRedrawsProcessed,
+            redrawsProcessed
+        );
+
+        if (measurePerformance)
+        {
+            LogSlowClientOperation(
+                "client-foreground-work",
+                GetElapsedMilliseconds(
+                    startTimestamp
+                ),
+                $"waterChecked={waterChecked}; " +
+                $"waterRegistered={waterRegistered}; " +
+                $"waterBatchesDropped={waterBatchesDropped}; " +
+                $"waterBatchAttempts={waterBatchAttempts}; " +
+                $"pendingWaterBatches={PendingWaterScanBatches.Count}; " +
+                $"redrawsProcessed={redrawsProcessed}; " +
+                $"redrawAttempts={redrawAttempts}; " +
+                $"pendingRedraws={PendingChunkRedraws.Count}; " +
+                "thread=main"
+            );
+        }
+    }
+
+    private static bool QueueChunkRedraw(
+        ChunkKey chunkKey,
+        string reason
+    )
+    {
+        if (!PendingChunkRedraws.TryAdd(
+                chunkKey,
+                reason
+            ))
+        {
+            return false;
+        }
+
+        PendingChunkRedrawQueue.Enqueue(
+            chunkKey
+        );
+
+        Interlocked.Increment(
+            ref chunkRedrawRequestsQueued
+        );
+
+        return true;
     }
 
     private static void RefreshRoomWaterRegistrationAt(
@@ -1992,10 +2913,16 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
         StillGreenhousesConfig? config =
             Config;
 
+        // A change at this block can remove, submerge, or expose a source at
+        // this exact coordinate. Clear only the liquid target first; a plant
+        // registration sharing the coordinate must survive the recheck.
+        StillGreenhousesRoomWindUniformRenderer
+            .RemoveWaterPosition(pos);
+
         if (
             config?.ApplyToWater != true
-            || PlantMovementMode
-                != RoomPlantMovementMode.VanillaLowWind
+            || !StillGreenhousesRoomWindEnvironment
+                .IsShaderDrivenMode(PlantMovementMode)
             || !StillGreenhousesShared.IsWaterSurfaceSourceBlock(
                 api.World.BlockAccessor,
                 pos
@@ -2038,6 +2965,11 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
         {
             return;
         }
+
+        QueueRoomInspectionRefreshForBlockChange(
+            api,
+            pos
+        );
 
         StillGreenhousesRoomWindUniformRenderer
             .RemovePosition(pos);
@@ -2106,11 +3038,12 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
                     chunkKey
                 ] = 0;
             }
-            else if (
-                RepresentativeVegetationByChunk
-                    .ContainsKey(chunkKey)
-            )
+            else
             {
+                // The cached complete-negative snapshot proves this chunk was
+                // previously relevant. Do not require its representative
+                // vegetation entry to survive before asking the authoritative
+                // server to revalidate a structural room change.
                 RequestChunk(chunkKey);
             }
         }
@@ -2126,6 +3059,20 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
         {
             return;
         }
+
+        StillGreenhousesConfig? config =
+            Config;
+
+        if (config == null)
+        {
+            return;
+        }
+
+        ChunkKey playerChunk =
+            GetPlayerChunk(api);
+
+        int retentionRadius =
+            config.ClientCacheRadiusChunks;
 
         HashSet<ChunkKey> candidates = new(
             ChunkSnapshots.Keys
@@ -2143,11 +3090,20 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
             PendingChunkRequests.Keys
         );
 
+        candidates.UnionWith(
+            LatestQueuedWaterScanRevision.Keys
+        );
+
+        candidates.UnionWith(
+            PendingChunkRedraws.Keys
+        );
+
         foreach (ChunkKey chunkKey in candidates)
         {
             if (IsChunkWithinClientRetentionRadius(
-                    api,
-                    chunkKey
+                    playerChunk,
+                    chunkKey,
+                    retentionRadius
                 ))
             {
                 continue;
@@ -2200,6 +3156,16 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
                 chunkKey,
                 out _
             );
+
+            LatestQueuedWaterScanRevision.TryRemove(
+                chunkKey,
+                out _
+            );
+
+            PendingChunkRedraws.TryRemove(
+                chunkKey,
+                out _
+            );
         }
     }
 
@@ -2232,13 +3198,29 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
             ChunkKey playerChunk =
                 GetPlayerChunk(api);
 
+            int generation =
+                Volatile.Read(
+                    ref clientWorldGeneration
+                );
+
+            PlayerChunkSnapshot? currentSnapshot =
+                Volatile.Read(
+                    ref latestPlayerChunkSnapshot
+                );
+
+            if (
+                currentSnapshot?.Chunk == playerChunk
+                && currentSnapshot.Generation == generation
+            )
+            {
+                return;
+            }
+
             Volatile.Write(
                 ref latestPlayerChunkSnapshot,
                 new PlayerChunkSnapshot(
                     playerChunk,
-                    Volatile.Read(
-                        ref clientWorldGeneration
-                    )
+                    generation
                 )
             );
         }
@@ -2433,9 +3415,18 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
             $"queuedDiscovery={QueuedDiscoveryChunks.Count}/{Config.MaxQueuedDiscoveryChunks}; " +
             $"pendingRequests={PendingChunkRequests.Count}; " +
             $"staleNegativeGuards={IgnoreNextCompleteNegativeSnapshot.Count}; " +
-            $"snapshotPacketsQueued={Math.Max(0, Volatile.Read(ref snapshotPacketsQueued))}; " +
+            $"snapshotPacketsQueued={GetQueuedSnapshotPacketCount()}; " +
+            $"snapshotPipelineInFlight={Volatile.Read(ref snapshotPipelineInFlight)}; " +
+            $"requestBatchHandoffInFlight={Volatile.Read(ref requestBatchHandoffInFlight)}; " +
             $"discoveryWorkerActive={discoveryWorkerTask?.IsCompleted == false}; " +
             $"snapshotWorkerActive={snapshotPreparationWorkerTask?.IsCompleted == false}; " +
+            $"pendingWaterBatches={PendingWaterScanBatches.Count}; " +
+            $"pendingRedraws={PendingChunkRedraws.Count}; " +
+            $"waterScanPositionsChecked={Interlocked.Read(ref waterScanPositionsChecked)}; " +
+            $"waterScanPositionsRegistered={Interlocked.Read(ref waterScanPositionsRegistered)}; " +
+            $"waterScanBatchesDropped={Interlocked.Read(ref waterScanBatchesDropped)}; " +
+            $"chunkRedrawRequestsQueued={Interlocked.Read(ref chunkRedrawRequestsQueued)}; " +
+            $"chunkRedrawsProcessed={Interlocked.Read(ref chunkRedrawsProcessed)}; " +
             $"snapshots={ChunkSnapshots.Count}; " +
             $"observedChunks={RepresentativeVegetationByChunk.Count}; " +
             $"roomWindShaderOriginPrepared={StillGreenhousesRoomWindShaderPatch.OriginPrepared}; " +
@@ -2465,9 +3456,10 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
             $"roomWindTopsoilCommentedWarpDetected={StillGreenhousesRoomWindShaderPatch.TopsoilCommentedVertexWarpDetected}; " +
             $"roomWindShaderFunctionSourceChunksLogged={StillGreenhousesRoomWindShaderPatch.FunctionSourceChunksLogged}; " +
             $"roomWindShaderLastFailure={StillGreenhousesRoomWindShaderPatch.LastFailureReason}; " +
-            $"roomWindTransport=RoomTypeSharedVanillaStates; " +
+            $"roomWindTransport=QuarterBlockTextureHash+RoomTypeSharedVanillaStates; " +
             $"roomWindShaderTopology={StillGreenhousesRoomWindShaderPatch.ShaderTopology}; " +
             $"roomWindShaderSpatialMatch={StillGreenhousesRoomWindShaderPatch.AbsolutePositionStrategy}; " +
+            $"roomWindDebugCallSiteProof={Config.DebugRoomWindCallSiteProof}; " +
             $"roomWindDebugVisualProof={Config.DebugRoomWindVisualProof}; " +
             $"greenhouseWindRange={StillGreenhousesRoomWindEnvironment.DescribeRange(Config, ManagedRoomType.Greenhouse)}; " +
             $"greenhouseWindCurrentPercent={StillGreenhousesRoomWindUniformRenderer.GreenhouseCurrentPercent:0.###}; " +
@@ -2475,19 +3467,43 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
             $"cellarWindCurrentPercent={StillGreenhousesRoomWindUniformRenderer.CellarCurrentPercent:0.###}; " +
             $"roomWindRange={StillGreenhousesRoomWindEnvironment.DescribeRange(Config, ManagedRoomType.Room)}; " +
             $"roomWindCurrentPercent={StillGreenhousesRoomWindUniformRenderer.RoomCurrentPercent:0.###}; " +
+            $"greenhouseWaterWindRange={StillGreenhousesRoomWindEnvironment.DescribeRange(Config, ManagedRoomType.Greenhouse, RoomWindTargetKind.Water)}; " +
+            $"greenhouseWaterWindCurrentPercent={StillGreenhousesRoomWindUniformRenderer.GreenhouseWaterCurrentPercent:0.###}; " +
+            $"cellarWaterWindRange={StillGreenhousesRoomWindEnvironment.DescribeRange(Config, ManagedRoomType.Cellar, RoomWindTargetKind.Water)}; " +
+            $"cellarWaterWindCurrentPercent={StillGreenhousesRoomWindUniformRenderer.CellarWaterCurrentPercent:0.###}; " +
+            $"roomWaterWindRange={StillGreenhousesRoomWindEnvironment.DescribeRange(Config, ManagedRoomType.Room, RoomWindTargetKind.Water)}; " +
+            $"roomWaterWindCurrentPercent={StillGreenhousesRoomWindUniformRenderer.RoomWaterCurrentPercent:0.###}; " +
             $"roomWindRegisteredPositions={StillGreenhousesRoomWindUniformRenderer.RegisteredPositionCount}; " +
             $"roomWindValidPositions={StillGreenhousesRoomWindUniformRenderer.ValidPositionCount}; " +
-            $"roomWindUploadedPositions={StillGreenhousesRoomWindUniformRenderer.UploadedPositionCount}/{StillGreenhousesRoomWindUniformRenderer.MaxUploadedPositions}; " +
-            $"roomWindPositionBudget=Greenhouse:{StillGreenhousesRoomWindUniformRenderer.GreenhouseReservedPositionBudget},Cellar:{StillGreenhousesRoomWindUniformRenderer.CellarReservedPositionBudget},Room:{StillGreenhousesRoomWindUniformRenderer.RoomReservedPositionBudget}+nearest-redistribution; " +
+            $"roomWindCompactedEnvelopes={StillGreenhousesRoomWindUniformRenderer.CompactedEnvelopeCount}; " +
+            $"roomWindHashCells={StillGreenhousesRoomWindUniformRenderer.UploadedPositionCount}; " +
+            $"roomWindHashCoveredCells={StillGreenhousesRoomWindUniformRenderer.UploadedCoveredPositionCount}; " +
+            $"roomWindLegacyPositionBudgetIgnored={StillGreenhousesRoomWindUniformRenderer.ConfiguredPositionBudget}; " +
             $"roomWindUploadedPositionsGreenhouse={StillGreenhousesRoomWindUniformRenderer.UploadedGreenhousePositionCount}; " +
             $"roomWindUploadedPositionsCellar={StillGreenhousesRoomWindUniformRenderer.UploadedCellarPositionCount}; " +
             $"roomWindUploadedPositionsRoom={StillGreenhousesRoomWindUniformRenderer.UploadedRoomPositionCount}; " +
             $"roomWindUploadedStates={StillGreenhousesRoomWindUniformRenderer.UploadedRoomStateCount}/{StillGreenhousesRoomWindUniformRenderer.UploadedRoomTypeStateCount}; " +
             $"roomWindUniformPrograms={StillGreenhousesRoomWindUniformRenderer.ActiveProgramCount}/{StillGreenhousesRoomWindUniformRenderer.TargetProgramCount}; " +
             $"roomWindVegetationPrograms={StillGreenhousesRoomWindUniformRenderer.ActiveVegetationProgramCount}/{StillGreenhousesRoomWindUniformRenderer.VegetationTargetProgramCount}; " +
+            $"roomWindTerrainVegetationPrograms={StillGreenhousesRoomWindUniformRenderer.ActiveTerrainVegetationProgramCount}/{StillGreenhousesRoomWindUniformRenderer.TerrainVegetationTargetProgramCount}; " +
+            $"roomWindAuxiliaryVegetationPrograms={StillGreenhousesRoomWindUniformRenderer.ActiveAuxiliaryVegetationProgramCount}/{StillGreenhousesRoomWindUniformRenderer.AuxiliaryVegetationTargetProgramCount}; " +
             $"roomWindLiquidPrograms={StillGreenhousesRoomWindUniformRenderer.ActiveLiquidProgramCount}/{StillGreenhousesRoomWindUniformRenderer.LiquidTargetProgramCount}; " +
             $"roomWindRequiredChunkOpaqueBound={StillGreenhousesRoomWindUniformRenderer.RequiredChunkOpaqueBound}; " +
-            $"roomWindPositionSnapshotRevision={StillGreenhousesRoomWindUniformRenderer.SnapshotRevision}"
+            $"roomWindLastUniformUploadFailure={StillGreenhousesRoomWindUniformRenderer.LastUniformUploadFailure}; " +
+            $"roomWindPositionSnapshotRevision={StillGreenhousesRoomWindUniformRenderer.SnapshotRevision}; " +
+            $"roomWindRegistrationRevision={StillGreenhousesRoomWindUniformRenderer.RegistrationRevision}; " +
+            $"roomWindTopologyRefreshRuns={StillGreenhousesRoomWindUniformRenderer.TopologyRefreshRuns}; " +
+            $"roomWindTopologyRefreshSkips={StillGreenhousesRoomWindUniformRenderer.TopologyRefreshSkips}; " +
+            $"roomWindTopologyCandidatesEvaluated={StillGreenhousesRoomWindUniformRenderer.TopologyCandidatesEvaluated}; " +
+            $"roomWindTopologyLastMs={StillGreenhousesRoomWindUniformRenderer.LastTopologyRefreshMs:F3}; " +
+            $"roomWindTopologyMaxMs={StillGreenhousesRoomWindUniformRenderer.MaxTopologyRefreshMs:F3}; " +
+            $"roomWindProgramDiscoveryRuns={StillGreenhousesRoomWindUniformRenderer.ProgramDiscoveryRuns}; " +
+            $"roomWindProgramDiscoveryLastMs={StillGreenhousesRoomWindUniformRenderer.LastProgramDiscoveryMs:F3}; " +
+            $"roomWindProgramDiscoveryMaxMs={StillGreenhousesRoomWindUniformRenderer.MaxProgramDiscoveryMs:F3}; " +
+            $"roomWindUniformUploadRuns={StillGreenhousesRoomWindUniformRenderer.UniformUploadRuns}; " +
+            $"roomWindUniformProgramBindOperations={StillGreenhousesRoomWindUniformRenderer.UniformProgramBindOperations}; " +
+            $"roomWindUniformUploadLastMs={StillGreenhousesRoomWindUniformRenderer.LastUniformUploadMs:F3}; " +
+            $"roomWindUniformUploadMaxMs={StillGreenhousesRoomWindUniformRenderer.MaxUniformUploadMs:F3}"
         );
 
         LogRoomWindShaderUniforms();
@@ -2545,11 +3561,17 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
         }
 
         api.Event.EnqueueMainThreadTask(
-            () => api.Logger.Notification(
-                "[StillGreenhouses] ConfigLib settings saved. " +
-                "Restart the client for Still Greenhouses changes to take effect."
-            ),
-            "stillgreenhouses-configlib-restart-notice"
+            () =>
+            {
+                ApplyRoomInspectionConfigSaved(api);
+
+                api.Logger.Notification(
+                    "[StillGreenhouses] ConfigLib settings saved. " +
+                    "The room inspection overlay setting was applied immediately; " +
+                    "restart the client for other Still Greenhouses changes."
+                );
+            },
+            "stillgreenhouses-configlib-saved"
         );
     }
 
@@ -2572,12 +3594,13 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
                 continue;
             }
 
-            MarkChunkDirty(
-                api,
-                entry.Key
-            );
-
-            redrawCount++;
+            if (QueueChunkRedraw(
+                    entry.Key,
+                    "shader-bridge-state-change"
+                ))
+            {
+                redrawCount++;
+            }
         }
 
         return redrawCount;
@@ -2598,12 +3621,72 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
             ref clientWorldGeneration
         );
 
+        // Invalidate any accepted request handoff from the world being left.
+        // Generation-tagged callbacks cannot clear a newer world's marker.
+        Interlocked.Exchange(
+            ref requestBatchHandoffInFlight,
+            0
+        );
+
         Volatile.Write(
             ref latestPlayerChunkSnapshot,
             null
         );
 
+        roomWindUniformRenderer
+            ?.PrepareForWorldTransition();
+
+        ResetRoomInspectionState(
+            Capi,
+            clearHighlight: true
+        );
+
         ClearClientCache();
+    }
+
+    private void OnLevelFinalize()
+    {
+        roomWindUniformRenderer
+            ?.PrepareForWorldTransition();
+
+        ICoreClientAPI? api = Capi;
+
+        ResetRoomInspectionState(
+            api,
+            clearHighlight: true
+        );
+
+        if (api != null)
+        {
+            int generation = Volatile.Read(
+                ref clientWorldGeneration
+            );
+
+            // Wait until the first normal world-render initialization has had
+            // time to complete before creating the client highlight state.
+            // This prevents the overlay from participating in login-time
+            // renderer construction.
+            api.Event.RegisterCallback(
+                _elapsedSeconds =>
+                {
+                    if (
+                        generation
+                            != Volatile.Read(
+                                ref clientWorldGeneration
+                            )
+                        || Capi != api
+                    )
+                    {
+                        return;
+                    }
+
+                    InitializeRoomInspection(api);
+                },
+                1000
+            );
+        }
+
+        UpdatePlayerChunkSnapshot(0f);
     }
 
     private static void ClearClientCache()
@@ -2617,15 +3700,19 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
         KnownRenderPaths.Clear();
         KnownGreenhousePolicies.Clear();
         KnownWindAdjustments.Clear();
+        KnownFlowerMeshProcesses.Clear();
         KnownUnclassifiedWindBlocks.Clear();
+        KnownContainerWindTargets.Clear();
+        KnownWindMeshFallbackTargets.Clear();
+
+        PendingWaterScanBatches.Clear();
+        LatestQueuedWaterScanRevision.Clear();
+        PendingChunkRedrawQueue.Clear();
+        PendingChunkRedraws.Clear();
 
         StillGreenhousesRoomWindUniformRenderer
             .ClearRegisteredPositions();
 
-        Interlocked.Exchange(
-            ref snapshotPacketsQueued,
-            0
-        );
     }
 
     private static WindBitSummary SummarizeWindBits(
@@ -2847,12 +3934,20 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
         if (api != null)
         {
             api.Event.LeaveWorld -= OnLeaveWorld;
+            api.Event.LevelFinalize -= OnLevelFinalize;
             api.Event.BlockChanged -= OnBlockChanged;
 
             if (playerChunkTickListenerId != 0)
             {
                 api.Event.UnregisterGameTickListener(
                     playerChunkTickListenerId
+                );
+            }
+
+            if (foregroundWorkTickListenerId != 0)
+            {
+                api.Event.UnregisterGameTickListener(
+                    foregroundWorkTickListenerId
                 );
             }
 
@@ -2873,6 +3968,8 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
             api.Event.UnregisterEventBusListener(
                 OnConfigLibConfigSaved
             );
+
+            DisposeRoomInspection(api);
 
             if (roomWindUniformRenderer != null)
             {
@@ -2918,15 +4015,46 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
     );
 
     private sealed record PreparedRequestBatch(
-        ChunkKey[] Chunks,
+        PendingChunkRequest[] Requests,
         int Generation,
         double SelectionElapsedMs
+    );
+
+    private readonly record struct PendingChunkRequest(
+        ChunkKey Chunk,
+        long LeaseId
     );
 
     private sealed record QueuedSnapshotPacket(
         GreenhouseChunkSnapshot Packet,
         int Generation
     );
+
+    private sealed class PendingWaterScanBatch
+    {
+        internal ChunkKey Chunk { get; }
+
+        internal long Revision { get; }
+
+        internal GreenhouseMembershipPos[] Positions { get; }
+
+        internal int Generation { get; }
+
+        internal int NextIndex { get; set; }
+
+        internal PendingWaterScanBatch(
+            ChunkKey chunk,
+            long revision,
+            GreenhouseMembershipPos[] positions,
+            int generation
+        )
+        {
+            Chunk = chunk;
+            Revision = revision;
+            Positions = positions;
+            Generation = generation;
+        }
+    }
 
     private sealed record PreparedChunkSnapshot(
         QueuedSnapshotPacket Queued,
@@ -2935,7 +4063,10 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
         long ExpectedOldRevision,
         ulong ExpectedOldContentHash,
         RoomPolicySnapshot Policy,
-        GreenhouseMembershipPos[] ChangedConfiguredPositions,
+        GreenhouseMembershipPos[] NewConfiguredPositions,
+        int ChangedConfiguredPositionCount,
+        int AddedConfiguredPositionCount,
+        bool ChangedTouchesChunkMinY,
         double PreparationElapsedMs
     );
 
@@ -2974,6 +4105,12 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
             };
     }
 
+    private readonly record struct ContainerWindTargetLogKey(
+        string ContainerCode,
+        string ContainerRuntime,
+        string Source
+    );
+
     private enum SnapshotCommitDisposition
     {
         Commit,
@@ -2988,27 +4125,6 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
         ulong ContentHash,
         GreenhouseRegion[] Greenhouses
     );
-
-    private readonly record struct ObservedVegetationPos(
-        int X,
-        int Y,
-        int Z,
-        int Dimension
-    )
-    {
-        internal static ObservedVegetationPos From(
-            BlockPos pos
-        ) =>
-            new(
-                pos.X,
-                pos.Y,
-                pos.Z,
-                pos.dimension
-            );
-
-        internal BlockPos ToBlockPos() =>
-            new(X, Y, Z, Dimension);
-    }
 
     private readonly record struct GreenhousePolicyLogKey(
         ChunkKey Chunk,
@@ -3042,10 +4158,41 @@ public sealed partial class StillGreenhousesClientSystem : ModSystem
             );
     }
 
+    private readonly record struct ObservedVegetationPos(
+        int X,
+        int Y,
+        int Z,
+        int Dimension
+    )
+    {
+        internal static ObservedVegetationPos From(
+            BlockPos pos
+        ) =>
+            new(
+                pos.X,
+                pos.Y,
+                pos.Z,
+                pos.dimension
+            );
+
+        internal BlockPos ToBlockPos() =>
+            new(X, Y, Z, Dimension);
+    }
+
     private readonly record struct WindAdjustmentLogKey(
         GreenhouseKey Greenhouse,
         string BlockCode,
         RoomPlantMovementMode MovementMode
+    );
+
+    private readonly record struct FlowerMeshProcessLogKey(
+        string BlockCode,
+        string Source,
+        int X,
+        int Y,
+        int Z,
+        int Dimension,
+        int MeshIdentity
     );
 
     private readonly record struct RenderPathKey(

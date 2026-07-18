@@ -20,16 +20,93 @@
       "clientSide": true
     },
     {
+      "type": "separator",
+      "title": "stillgreenhouses:config-room-inspection-title"
+    },
+    {
+      "code": "ShowRoomInspectionOverlay",
+      "ingui": "stillgreenhouses:config-room-inspection-enabled",
+      "comment": "stillgreenhouses:config-room-inspection-enabled-comment",
+      "type": "boolean",
+      "default": false,
+      "clientSide": true
+    },
+    {
+      "type": "separator",
+      "title": "stillgreenhouses:config-room-inspection-legend-title"
+    },
+    {
+      "type": "separator",
+      "title": "stillgreenhouses:config-room-inspection-legend-invalid"
+    },
+    {
+      "type": "separator",
+      "title": "stillgreenhouses:config-room-inspection-legend-normal-fail"
+    },
+    {
+      "type": "separator",
+      "title": "stillgreenhouses:config-room-inspection-legend-greenhouse-fail"
+    },
+    {
+      "type": "separator",
+      "title": "stillgreenhouses:config-room-inspection-legend-cellar-fail"
+    },
+    {
+      "type": "separator",
+      "title": "stillgreenhouses:config-room-inspection-legend-normal-pass"
+    },
+    {
+      "type": "separator",
+      "title": "stillgreenhouses:config-room-inspection-legend-greenhouse-pass"
+    },
+    {
+      "type": "separator",
+      "title": "stillgreenhouses:config-room-inspection-legend-cellar-pass"
+    },
+    {
+      "type": "separator",
+      "title": "stillgreenhouses:config-room-inspection-legend-incomplete"
+    },
+    {
+      "type": "separator",
+      "title": "stillgreenhouses:config-room-inspection-server-note"
+    },
+    {
       "code": "GreenhouseWindMode",
       "ingui": "stillgreenhouses:config-greenhouse-wind-mode",
       "comment": "stillgreenhouses:config-greenhouse-wind-mode-comment",
       "type": "string",
       "default": "VanillaLowWind",
       "clientSide": true,
-      "values": [
-        "NoWind",
-        "VanillaLowWind"
-      ]
+      "mapping": {
+        "VanillaLowWind": "VanillaLowWind",
+        "VanillaNoWind": "VanillaNoWind"
+      }
+    },
+    {
+      "type": "separator",
+      "title": "stillgreenhouses:config-performance-title"
+    },
+    {
+      "code": "ExperimentalExtendedPositionCapacity",
+      "ingui": "stillgreenhouses:config-experimental-position-capacity",
+      "comment": "stillgreenhouses:config-experimental-position-capacity-comment",
+      "type": "boolean",
+      "default": false,
+      "clientSide": true
+    },
+    {
+      "code": "MaxAffectedPlants",
+      "ingui": "stillgreenhouses:config-max-affected-plants",
+      "comment": "stillgreenhouses:config-max-affected-plants-comment",
+      "type": "integer",
+      "default": 128,
+      "clientSide": true,
+      "range": {
+        "min": 1,
+        "max": 512,
+        "step": 1
+      }
     },
     {
       "type": "separator",
@@ -76,7 +153,8 @@
       "clientSide": true,
       "range": {
         "min": 0.0,
-        "max": 200.0
+        "max": 200.0,
+        "step": 0.1
       }
     },
     {
@@ -88,7 +166,8 @@
       "clientSide": true,
       "range": {
         "min": 0.0,
-        "max": 200.0
+        "max": 200.0,
+        "step": 0.1
       }
     },
     {
@@ -104,7 +183,8 @@
       "clientSide": true,
       "range": {
         "min": 0.0,
-        "max": 200.0
+        "max": 200.0,
+        "step": 0.1
       }
     },
     {
@@ -116,7 +196,8 @@
       "clientSide": true,
       "range": {
         "min": 0.0,
-        "max": 200.0
+        "max": 200.0,
+        "step": 0.1
       }
     },
     {
@@ -132,7 +213,8 @@
       "clientSide": true,
       "range": {
         "min": 0.0,
-        "max": 200.0
+        "max": 200.0,
+        "step": 0.1
       }
     },
     {
@@ -144,7 +226,8 @@
       "clientSide": true,
       "range": {
         "min": 0.0,
-        "max": 200.0
+        "max": 200.0,
+        "step": 0.1
       }
     },
     {
@@ -234,6 +317,100 @@
       "type": "boolean",
       "default": true,
       "clientSide": true
+    },
+    {
+      "type": "separator",
+      "title": "stillgreenhouses:config-water-wind-ranges-title"
+    },
+    {
+      "type": "separator",
+      "title": "stillgreenhouses:config-greenhouse-water-wind-range-title"
+    },
+    {
+      "code": "GreenhouseWaterWindLowerPercent",
+      "ingui": "stillgreenhouses:config-greenhouse-water-wind-lower",
+      "comment": "stillgreenhouses:config-greenhouse-water-wind-lower-comment",
+      "type": "float",
+      "default": 5.0,
+      "clientSide": true,
+      "range": {
+        "min": 0.0,
+        "max": 200.0,
+        "step": 0.1
+      }
+    },
+    {
+      "code": "GreenhouseWaterWindUpperPercent",
+      "ingui": "stillgreenhouses:config-greenhouse-water-wind-upper",
+      "comment": "stillgreenhouses:config-greenhouse-water-wind-upper-comment",
+      "type": "float",
+      "default": 5.0,
+      "clientSide": true,
+      "range": {
+        "min": 0.0,
+        "max": 200.0,
+        "step": 0.1
+      }
+    },
+    {
+      "type": "separator",
+      "title": "stillgreenhouses:config-cellar-water-wind-range-title"
+    },
+    {
+      "code": "CellarWaterWindLowerPercent",
+      "ingui": "stillgreenhouses:config-cellar-water-wind-lower",
+      "comment": "stillgreenhouses:config-cellar-water-wind-lower-comment",
+      "type": "float",
+      "default": 5.0,
+      "clientSide": true,
+      "range": {
+        "min": 0.0,
+        "max": 200.0,
+        "step": 0.1
+      }
+    },
+    {
+      "code": "CellarWaterWindUpperPercent",
+      "ingui": "stillgreenhouses:config-cellar-water-wind-upper",
+      "comment": "stillgreenhouses:config-cellar-water-wind-upper-comment",
+      "type": "float",
+      "default": 5.0,
+      "clientSide": true,
+      "range": {
+        "min": 0.0,
+        "max": 200.0,
+        "step": 0.1
+      }
+    },
+    {
+      "type": "separator",
+      "title": "stillgreenhouses:config-room-water-wind-range-title"
+    },
+    {
+      "code": "RoomWaterWindLowerPercent",
+      "ingui": "stillgreenhouses:config-room-water-wind-lower",
+      "comment": "stillgreenhouses:config-room-water-wind-lower-comment",
+      "type": "float",
+      "default": 5.0,
+      "clientSide": true,
+      "range": {
+        "min": 0.0,
+        "max": 200.0,
+        "step": 0.1
+      }
+    },
+    {
+      "code": "RoomWaterWindUpperPercent",
+      "ingui": "stillgreenhouses:config-room-water-wind-upper",
+      "comment": "stillgreenhouses:config-room-water-wind-upper-comment",
+      "type": "float",
+      "default": 5.0,
+      "clientSide": true,
+      "range": {
+        "min": 0.0,
+        "max": 200.0,
+        "step": 0.1
+      }
     }
   ]
 }
