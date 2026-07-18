@@ -3,10 +3,10 @@
   "modid": "stillgreenhouses",
   "name": "Still Greenhouses",
   "authors": [
-    "Scott Hoppe"
+    "GraveCatalyst"
   ],
   "description": "Applies configurable vegetation wind movement inside authoritative greenhouses, cellars, and rooms, with targeted tallgrass render-state and hardcoded client terrain-tessellator diagnostics.",
-  "version": "0.9.9",
+  "version": "4.0.0",
   "side": "Universal",
   "dependencies": {
     "game": "1.22.0",
